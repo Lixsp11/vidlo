@@ -8,7 +8,8 @@ version = "0.1"
 description = "GPU video frame reader: NVDEC decoding, CV-CUDA crop/convert/resize, local and object storage"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26"]
+# CV-CUDA 的库来自 cvcuda-cu12，不打包进 vidlo 的 wheel；扩展模块链接的库名带这个版本的哈希，版本要固定
+dependencies = ["numpy>=1.26", "cvcuda-cu12==0.19.0"]
 
 [project.optional-dependencies]
 # 读对象存储时才需要；只读本地文件的环境不必安装。urllib3 2.3 起才有 HTTPResponse.shutdown()，关闭时靠它打断读取
@@ -21,14 +22,14 @@ wheel.packages = ["src/vidlo"]
 build-dir = "build/{wheel_tag}"
 
 # 发布用的 wheel（.github/workflows/release.yml）：manylinux_2_28 容器里先用 ci/build_deps.sh 准备依赖，
-# auditwheel 把 FFmpeg、CV-CUDA 的库改名后拷进包里；libcuda、libnvcuvid 用部署环境的驱动库，不打包
+# auditwheel 把 FFmpeg 的库改名后拷进包里；CV-CUDA 用依赖包 cvcuda-cu12 的库，libcuda、libnvcuvid 用部署环境的驱动库，都不打包
 [tool.cibuildwheel]
 build = ["cp311-manylinux_x86_64", "cp312-manylinux_x86_64", "cp313-manylinux_x86_64", "cp314-manylinux_x86_64"]
 manylinux-x86_64-image = "manylinux_2_28"
 before-all = "bash ci/build_deps.sh"
-# 构建机没有 GPU 驱动：用占位库让扩展模块能加载，只检查导入（导入时不初始化 CUDA）
+# 构建机没有 GPU 驱动：用占位库让扩展模块能加载，只检查导入（导入时不初始化 CUDA，但要按 RPATH 找到 cvcuda-cu12 的库）
 test-command = "LD_LIBRARY_PATH=/opt/stubs python -c 'import vidlo; print(vidlo.__version__)'"
 
 [tool.cibuildwheel.linux]
-environment = { PATH = "/usr/local/cuda-12.8/bin:$PATH", SKBUILD_CMAKE_DEFINE = "VIDLO_FFMPEG_ROOT=/opt/ffmpeg;VIDLO_NVSDK_ROOT=/opt/nvsdk;VIDLO_CVCUDA_ROOT=/opt/nvidia/cvcuda0" }
-repair-wheel-command = "LD_LIBRARY_PATH=/opt/ffmpeg/lib:/opt/nvidia/cvcuda0/lib auditwheel repair --exclude libcuda.so.1 --exclude libnvcuvid.so.1 -w {dest_dir} {wheel}"
+environment = { PATH = "/usr/local/cuda-12.8/bin:$PATH", SKBUILD_CMAKE_DEFINE = "VIDLO_FFMPEG_ROOT=/opt/ffmpeg;VIDLO_NVSDK_ROOT=/opt/nvsdk;VIDLO_CVCUDA_ROOT=/opt/nvidia/cvcuda0;VIDLO_CVCUDA_LIBS=/opt/cvcuda_cu12/cvcuda_cu12.libs" }
+repair-wheel-command = "LD_LIBRARY_PATH=/opt/ffmpeg/lib auditwheel repair --exclude libcuda.so.1 --exclude libnvcuvid.so.1 --exclude 'libcvcuda-*' --exclude 'libnvcv_types-*' -w {dest_dir} {wheel}"

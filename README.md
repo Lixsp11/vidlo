@@ -36,7 +36,7 @@ pip install vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl            # local f
 pip install "vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl[s3,oss]"  # plus R2/S3 and OSS
 ```
 
-Needs an NVIDIA GPU with NVDEC and driver 570 or newer. In containers, `NVIDIA_DRIVER_CAPABILITIES` must include `video`.
+CV-CUDA is not bundled: pip installs it from PyPI as the `cvcuda-cu12` dependency. Needs an NVIDIA GPU with NVDEC and driver 570 or newer. In containers, `NVIDIA_DRIVER_CAPABILITIES` must include `video`.
 
 ## Usage
 

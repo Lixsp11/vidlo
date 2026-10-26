@@ -31,15 +31,14 @@ tar xJf "$WORK/ffmpeg.tar.xz" -C "$WORK"
   make install
 )
 
-# CV-CUDA 0.19.0（CUDA 12）：解压到根目录，库落在 /opt/nvidia/cvcuda0/lib，正是 libcvcuda 自带 RPATH 指向的位置，
-# auditwheel 才找得到它依赖的 libnvcv_types
-CVCUDA=https://github.com/CVCUDA/CV-CUDA/releases/download/v0.19.0
-download "$CVCUDA/cvcuda-lib-0.19.0-cuda12-x86_64-linux.tar.xz" "$WORK/cvcuda-lib.tar.xz" \
-  939d80e14c1ed48e5634524aa01bae398df1937b7270317abb7a55c9cb7f3146
-download "$CVCUDA/cvcuda-dev-0.19.0-cuda12-x86_64-linux.tar.xz" "$WORK/cvcuda-dev.tar.xz" \
-  abb71db72a908930a92ab6c60936621365380d3c255f84a53bd2224335d9784b
-tar xJf "$WORK/cvcuda-lib.tar.xz" -C /
+# CV-CUDA 0.19.0（CUDA 12）：头文件用 GitHub 发布的开发包（解压后在 /opt/nvidia/cvcuda0/include）；
+# 链接用运行时依赖的 cvcuda-cu12 wheel 里的库，解压到 /opt/cvcuda_cu12/cvcuda_cu12.libs
+download https://github.com/CVCUDA/CV-CUDA/releases/download/v0.19.0/cvcuda-dev-0.19.0-cuda12-x86_64-linux.tar.xz \
+  "$WORK/cvcuda-dev.tar.xz" abb71db72a908930a92ab6c60936621365380d3c255f84a53bd2224335d9784b
 tar xJf "$WORK/cvcuda-dev.tar.xz" -C /
+download https://files.pythonhosted.org/packages/bd/8d/24707d63b28076590c672769a44a9a79d061183d3190b730370bbd3b4a66/cvcuda_cu12-0.19.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+  "$WORK/cvcuda_cu12.whl" 16640219c25d1a2f926c8e00babe8d68bde6c76c3dff95a0a09b86dc46e5d653
+/opt/python/cp312-cp312/bin/python -m zipfile -e "$WORK/cvcuda_cu12.whl" /opt/cvcuda_cu12
 
 # Video Codec SDK：仓库里只带两个 MIT 许可的头文件；链接用的 libnvcuvid 占位库在这里编，目录结构同 SDK
 mkdir -p /opt/nvsdk/Interface /opt/nvsdk/Lib/linux/stubs/x86_64
