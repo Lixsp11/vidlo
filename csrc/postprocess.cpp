@@ -83,6 +83,9 @@ FrameProcessor::~FrameProcessor() {
       cuMemFree(ptr);
     }
   }
+  if (pinned_ != nullptr) {
+    cuMemFreeHost(pinned_);
+  }
 }
 
 void FrameProcessor::configure(const CUVIDEOFORMAT& format) {
@@ -119,6 +122,8 @@ void FrameProcessor::configure(const CUVIDEOFORMAT& format) {
 
   const size_t pixels = static_cast<size_t>(crop_width_) * crop_height_;
   nv12_ = allocate(pixels * 3 / 2);
+  const size_t output_bytes = spec_.rgb ? static_cast<size_t>(output_width_) * output_height_ * 3 : pixels * 3 / 2;
+  check_cu(cuMemHostAlloc(&pinned_, output_bytes, 0), "cuMemHostAlloc");
   if (!spec_.rgb) {
     return;
   }
@@ -156,7 +161,6 @@ void FrameProcessor::copy_in(CUdeviceptr frame, unsigned pitch, unsigned surface
   copy.dstDevice = nv12_ + static_cast<size_t>(crop_width_) * crop_height_;
   copy.Height = static_cast<size_t>(crop_height_ / 2);
   check_cu(cuMemcpy2DAsync(&copy, stream), "copy chroma");
-  check_cu(cuStreamSynchronize(stream), "cuStreamSynchronize");
 }
 
 std::vector<uint8_t> FrameProcessor::produce(CUstream stream) {
@@ -175,15 +179,12 @@ std::vector<uint8_t> FrameProcessor::produce(CUstream stream) {
     }
     bytes = static_cast<size_t>(output_width_) * output_height_ * 3;
   }
-  std::vector<uint8_t> host(bytes);
-  try {
-    check_cu(cuMemcpyDtoHAsync(host.data(), source, bytes, stream), "copy to host");
-    check_cu(cuStreamSynchronize(stream), "cuStreamSynchronize");
-  } catch (...) {
-    cuStreamSynchronize(stream);  // 已提交的复制可能还在写 host，等它结束再释放
-    throw;
-  }
-  return host;
+  // 复制到锁页内存才是真正异步的；复制到普通内存时驱动内部要等一次 GPU。一帧只在这里同步一次：
+  // 多个进程共用一张卡时，每次同步都要排队等 GPU 轮到本进程的 context
+  check_cu(cuMemcpyDtoHAsync(pinned_, source, bytes, stream), "copy to host");
+  check_cu(cuStreamSynchronize(stream), "cuStreamSynchronize");
+  const auto* data = static_cast<const uint8_t*>(pinned_);
+  return std::vector<uint8_t>(data, data + bytes);
 }
 
 }  // namespace vidlo

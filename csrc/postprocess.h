@@ -24,9 +24,9 @@ struct OutputSpec {
   std::string interpolation;         // 缩放时的插值："nearest_exact"、"linear"、"cubic"、"area"，由 Python 层按比例选好
 };
 
-// 把解码出的一帧变成交给调用方的输出：先把裁剪区域复制到自有的紧凑 NV12 显存（之后就能归还 surface），
-// 输出 RGB 时再用 CV-CUDA 转颜色、缩放，最后复制到内存。显存在 configure 时分配一次，每帧复用。
-// 所有调用（包括析构）都要在当前线程持有解码用的 CUDA context 时进行。
+// 把解码出的一帧变成交给调用方的输出：先把裁剪区域复制到自有的紧凑 NV12 显存（CV-CUDA 要亮度、色度行连续），
+// 输出 RGB 时再用 CV-CUDA 转颜色、缩放，经锁页内存复制到内存。这些都提交到同一个 stream，一帧只在 produce 末尾同步一次。
+// 显存和锁页内存在 configure 时分配一次，每帧复用。所有调用（包括析构）都要在当前线程持有解码用的 CUDA context 时进行。
 class FrameProcessor {
  public:
   explicit FrameProcessor(OutputSpec spec);
@@ -36,9 +36,10 @@ class FrameProcessor {
 
   // 建好解码器后调用一次：按 sequence 回调的显示区域确定裁剪位置、选插值方式、分配显存
   void configure(const CUVIDEOFORMAT& format);
-  // surface 映射期间调用：复制裁剪区域，等复制完成才返回。surface_height 是 surface 里亮度的行数（色度紧随其后）
+  // surface 映射期间调用：提交裁剪区域的复制，不等待。surface 要等 produce 返回（已同步）后才能归还。
+  // surface_height 是 surface 里亮度的行数（色度紧随其后）
   void copy_in(CUdeviceptr frame, unsigned pitch, unsigned surface_height, CUstream stream);
-  // 颜色转换、缩放，复制到内存后返回。RGB 为 [高, 宽, 3]；NV12 为 [高×3/2, 宽]
+  // 颜色转换、缩放，复制到内存，同步后返回。RGB 为 [高, 宽, 3]；NV12 为 [高×3/2, 宽]
   std::vector<uint8_t> produce(CUstream stream);
 
   int output_width() const { return output_width_; }
@@ -61,6 +62,7 @@ class FrameProcessor {
   CUdeviceptr nv12_ = 0;     // 裁剪后的紧凑 NV12：crop_height 行亮度后紧跟 crop_height/2 行交错色度，行宽 crop_width
   CUdeviceptr rgb_ = 0;      // 转换后的 RGB，裁剪尺寸
   CUdeviceptr resized_ = 0;  // 缩放后的 RGB，输出尺寸
+  void* pinned_ = nullptr;   // 锁页内存，一帧输出的大小
   std::unique_ptr<Gpu> gpu_;
 };
 

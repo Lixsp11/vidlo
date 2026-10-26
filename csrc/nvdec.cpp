@@ -446,17 +446,15 @@ int NvdecSession::handle_display(const CUVIDPARSERDISPINFO* display) {
     const auto surface_height = static_cast<unsigned>((snapshot_.create.ulTargetHeight + 1) & ~1ul);
     try {
       processor_->copy_in(frame, pitch, surface_height, stream_);
+      out.image = processor_->produce(stream_);
     } catch (...) {
-      cuStreamSynchronize(stream_);  // 复制可能还在读 surface：等它结束再归还
+      cuStreamSynchronize(stream_);  // 已提交的复制和处理可能还在读 surface、写锁页内存：等它们结束再归还
       throw;
     }
-  }
-  // 选中的帧已复制到自有显存，没选中的帧只检查状态：都可以归还 surface 了
-  check_cu(mapped.unmap(), "cuvidUnmapVideoFrame64");
-  if (keep) {
-    out.image = processor_->produce(stream_);
     ++stats_.kept;
   }
+  // produce 返回前已同步，选中的帧处理完了；没选中的帧只检查状态：都可以归还 surface 了
+  check_cu(mapped.unmap(), "cuvidUnmapVideoFrame64");
 
   frames_.push_back(std::move(out));
   ++stats_.displayed;
