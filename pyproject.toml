@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=3.0"]  # pybind11 3.0 起支持 Python 3.14
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vidlo"
+version = "0.1"
+description = "GPU video frame reader: NVDEC decoding, CV-CUDA crop/convert/resize, local and object storage"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+# 读对象存储时才需要；只读本地文件的环境不必安装。urllib3 2.3 起才有 HTTPResponse.shutdown()，关闭时靠它打断读取
+s3 = ["boto3>=1.36", "urllib3>=2.3"]
+oss = ["alibabacloud-oss-v2>=1.4", "urllib3>=2.3"]
+
+[tool.scikit-build]
+cmake.version = ">=3.22"
+wheel.packages = ["src/vidlo"]
+build-dir = "build/{wheel_tag}"
