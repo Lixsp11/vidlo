@@ -1,0 +1,361 @@
+"""公共读取接口，用法见 docs/api.md。
+
+当前实现到第一期：本地、R2（s3://）、OSS（oss://）的 MKV 顺序读，输出裁剪、缩放后的 RGB 或原生 NV12，可按步长或帧率选帧。
+架构里其余的参数和函数都保留，用到时报 UnsupportedError。
+"""
+
+from __future__ import annotations
+
+import os
+import weakref
+from dataclasses import dataclass
+from itertools import islice, repeat
+from typing import Any, Iterator
+
+import numpy as np
+
+from . import _hevc, _native, _storage
+from ._native import Error, UnsupportedError
+from ._sampler import EMDownSampler, Sampler, StrideSampler
+
+_COLORSPACES = ("bt601", "bt709", "bt2020")
+_INTERPOLATIONS = ("nearest_exact", "linear", "cubic", "area")
+_FORMATS = ("rgb24", "nv12")
+_REMOTE_SCHEMES = ("s3://", "oss://")
+# 码流的 matrix_coefficients（H.265 表 E.5）→ CV-CUDA 能用的矩阵
+_SOURCE_COLORSPACES = {1: "bt709", 5: "bt601", 6: "bt601", 9: "bt2020"}
+_SELECTION_CHUNK = 4096  # 每次交给 C++ 的选帧决定个数
+
+
+@dataclass(frozen=True)
+class Frame:
+    """一帧画面和它在录像里的位置。format="rgb24" 时 image 形状为 [高, 宽, 3]；
+    format="nv12" 时是 NV12，形状为 [高×3/2, 宽]。decode_order 到 packet_end 四项是写视频索引用的。"""
+
+    image: np.ndarray
+    number: int  # 显示顺序中的帧号，从 0 开始，没选中的帧也计数
+    pts: int  # 录像里的原始 PTS，乘 metadata.time_base 是秒
+    key_frame: bool
+    decode_status: int  # cuvidGetDecodeStatus 的结果，交出的帧都是成功
+    decode_order: int  # 这帧的包在解码顺序中排第几
+    decode_start: int  # 要正确解出这帧须从解码顺序的第几个包开始送
+    packet_start: int  # 这帧的压缩数据在文件里的起止字节，不含 MKV 块头
+    packet_end: int
+    colorspace: str | None = None  # RGB 时实际用的矩阵
+    interpolation: str | None = None  # 实际用的插值；没缩放或 NV12 时为 None
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    """录像信息，打开时读文件头就全部得到。画面尺寸和颜色标记从码流的 SPS 读出；container_ 开头的三项是 MKV 容器
+    另记的颜色信息（FFmpeg 的枚举值），打开时与 SPS 核对。"""
+
+    container: str  # libavformat 的格式名，如 "matroska,webm"
+    codec: str
+    codec_config: bytes  # 文件头里的解码参数（MKV 的 hvcC），写视频索引要用
+    time_base: tuple[int, int]  # (分子, 分母)
+    file_size: int
+    width: int  # 显示区域的尺寸，不随 crop、width、height 参数改变
+    height: int
+    full_range: bool
+    matrix_coefficients: int  # H.265 表 E.5 的编号：1 为 BT.709，2 为未标注
+    chroma_location: int  # ChromaLocType：0 为 type 0
+    container_range: int  # AVColorRange：0 未指定，1 limited，2 full
+    container_matrix: int  # AVColorSpace，编号同 matrix_coefficients
+    container_chroma_location: int  # AVChromaLocation：0 未指定，1 起依次是 type 0 到 5
+    etag: str | None  # 远程对象的 ETag，读取期间用它确认对象没变；本地文件为 None
+
+
+def _color_conflicts(sps: _hevc.Sps, container: dict[str, int]) -> list[str]:
+    """SPS 与容器（MKV Colour 元素）都明确写了、但写得不一样的颜色标记。只看影响 RGB 转换的范围、矩阵和色度位置；
+    一方没写时不算冲突，也不拿容器的值代替 SPS 按标准推断的值。容器的值是 FFmpeg 的枚举：范围 1 limited、2 full；
+    矩阵编号同 matrix_coefficients，2 为未指定；色度位置 0 为未指定，1 起依次是 type 0 到 5。"""
+    conflicts = []
+    if container["range"] in (1, 2) and sps.video_signal_type_present and (container["range"] == 2) != bool(sps.video_full_range_flag):
+        conflicts.append(f"color range (container {'full' if container['range'] == 2 else 'limited'}, "
+                         f"SPS {'full' if sps.video_full_range_flag else 'limited'})")
+    if container["matrix"] != 2 and sps.matrix_coefficients != 2 and container["matrix"] != sps.matrix_coefficients:
+        conflicts.append(f"matrix coefficients (container {container['matrix']}, SPS {sps.matrix_coefficients})")
+    if (container["chroma_location"] != 0 and sps.chroma_loc_info_present
+            and container["chroma_location"] - 1 != sps.chroma_sample_loc_type_top_field):
+        conflicts.append(f"chroma location (container type {container['chroma_location'] - 1}, "
+                         f"SPS type {sps.chroma_sample_loc_type_top_field})")
+    return conflicts
+
+
+def _interpolation(requested: str | None, source: tuple[int, int], target: tuple[int, int]) -> str:
+    """实际用的插值：没指定时，有一个方向缩小就用面积插值（缩小时没有摩尔纹），否则用三次插值。nearest_exact 取半像素中心：
+    输出第 i 个像素取源的 floor((i + 0.5) × 源长 / 目标长)，同 PIL、cv2.INTER_NEAREST_EXACT，不同于 cv2.INTER_NEAREST。
+
+    CV-CUDA 0.19 的面积插值没有放大分支：放大方向上，输出像素对应的源区间整个落在一个源像素内部时，这个像素被区间两端
+    各算一次，权重和大于 1，结果偏大到接近 255；1.5、2 倍时每个区间都碰到像素边界，所以与 OpenCV 一致，其他倍数差到
+    一两百级（CV-CUDA 0.19 的 cvcuda/cuda_tools/InterpolationWrap.hpp 里 AREA 的区间计算）。
+    所以面积插值遇到放大的方向时报错，包括一个方向缩小、另一个方向放大；不自动换成别的插值，以免悄悄改掉调用方要的算法。
+    """
+    shrinks = target[0] < source[0] or target[1] < source[1]
+    enlarges = target[0] > source[0] or target[1] > source[1]
+    method = requested or ("area" if shrinks else "cubic")
+    if method == "area" and enlarges:
+        raise UnsupportedError(f"area interpolation for {source[0]}x{source[1]} -> {target[0]}x{target[1]} enlarges in one direction, "
+                               "which is not supported yet (CV-CUDA 0.19 AREA is only reliable when shrinking); "
+                               "pass interpolation='linear' or 'cubic'")
+    return method
+
+
+def _check_ints(name: str, value: Any, count: int, positive_from: int) -> tuple[int, ...]:
+    if (not isinstance(value, (tuple, list)) or len(value) != count
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in value)):
+        raise ValueError(f"{name} must be {count} integers, got {value!r}")
+    if any(v < 0 for v in value) or any(v <= 0 for v in value[positive_from:]):
+        raise ValueError(f"{name} has negative or zero values: {value!r}")
+    return tuple(value)
+
+
+def _check_positive_int(name: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
+def _sampler(step: int | None, fps: float | None, source_fps: float | None) -> Sampler | None:
+    """frames() 的选帧参数换成内部的采样器：step 为整数步长，fps 与 source_fps 为 VPF 的按帧率降采样；都不给时保留全部帧。"""
+    if step is not None:
+        if fps is not None or source_fps is not None:
+            raise ValueError("step cannot be combined with fps/source_fps")
+        return StrideSampler(_check_positive_int("step", step))
+    if fps is None and source_fps is None:
+        return None
+    if fps is None or source_fps is None:
+        raise ValueError("fps and source_fps must be given together")
+    return EMDownSampler(source_fps, fps)
+
+
+class VideoReader:
+    """打开一段录像读帧。参数在打开前检查，打开时只读文件头；只在一个线程里使用。
+
+    source 为本地路径、s3://桶/路径（R2 等 S3 兼容存储）或 oss://桶/路径。crop 为 (x, y, 宽, 高)，坐标相对于显示区域，
+    四个数都必须是偶数（每 2×2 像素共用一份色度）；width、height 为输出尺寸，没给的一边保持裁剪后的尺寸。colorspace 是
+    YUV 换成 RGB 用的矩阵，None 按录像标记。format="nv12" 是解码器的原始输出，不裁剪、不缩放、不换颜色。index 为视频
+    索引（按帧号读时用，第二期）。storage_options 是交给存储 SDK 的连接参数，见 _storage.py。
+    """
+
+    def __init__(
+        self,
+        source: str | os.PathLike[str],
+        *,
+        device: int = 0,
+        crop: tuple[int, int, int, int] | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        interpolation: str | None = None,
+        colorspace: str | None = None,
+        format: str = "rgb24",
+        index: Any = None,
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(device, int) or isinstance(device, bool) or device < 0:
+            raise ValueError(f"device must be a non-negative integer, got {device!r}")
+        if crop is not None:
+            crop = _check_ints("crop", crop, 4, 2)
+            if any(v % 2 for v in crop):
+                raise ValueError(f"crop values must be even (4:2:0 chroma is shared by 2x2 pixels), got {crop!r}")
+        if width is not None:
+            _check_positive_int("width", width)
+        if height is not None:
+            _check_positive_int("height", height)
+        if interpolation is not None and interpolation not in _INTERPOLATIONS:
+            raise ValueError(f"interpolation must be None or one of {_INTERPOLATIONS}, got {interpolation!r}")
+        if colorspace is not None and colorspace not in _COLORSPACES:
+            raise ValueError(f"colorspace must be None or one of {_COLORSPACES}, got {colorspace!r}")
+        if format not in _FORMATS:
+            raise ValueError(f"format must be one of {_FORMATS}, got {format!r}")
+        if format == "nv12" and any(v is not None for v in (crop, width, height, interpolation, colorspace)):
+            raise ValueError("format='nv12' is the decoder's raw output; crop, width, height, interpolation and colorspace do not apply")
+        if index is not None:
+            raise UnsupportedError("reading by frame number (index=...) is not implemented yet")
+        self._device = device
+        self._crop = crop
+        self._width = width
+        self._height = height
+        self._interpolation = interpolation
+        self._colorspace = colorspace
+        self._format = format
+        self._started = False
+        self._closed = False
+
+        download = None
+        if isinstance(source, str) and "://" in source:
+            if not source.startswith(_REMOTE_SCHEMES):
+                raise ValueError(f"unknown source scheme in {source!r}; use a local path, s3:// or oss://")
+            download = _storage.open_download(source, storage_options)
+            name, data = source, download.input
+        else:
+            if storage_options is not None:
+                raise ValueError("storage_options only apply to s3:// and oss:// sources")
+            name = os.fspath(source)
+            if not os.path.isfile(name):
+                raise FileNotFoundError(name)
+            data = _native.FileInput(name)
+        native = None
+        try:
+            native = _native.SequentialDecoder(data, name)
+            info = native.info()
+            sps = _hevc.stream_sps(info["codec_config"])
+            native.start(device, self._output_spec(sps, info["container_color"]))
+        except BaseException:
+            if download is not None:
+                download.close()
+            if native is not None:
+                native.close()
+            raise
+        left, top, right, bottom = sps.display_area
+        color = info["container_color"]
+        self._native = native
+        self._metadata = VideoMetadata(
+            container=info["container"], codec=info["codec"], codec_config=info["codec_config"], time_base=tuple(info["time_base"]),
+            file_size=info["file_size"], width=right - left, height=bottom - top, full_range=bool(sps.video_full_range_flag),
+            matrix_coefficients=sps.matrix_coefficients, chroma_location=sps.chroma_sample_loc_type_top_field,
+            container_range=color["range"], container_matrix=color["matrix"], container_chroma_location=color["chroma_location"],
+            etag=None if download is None else download.etag)
+        self._download = download
+        if download is not None:
+            # 没有 close 就丢掉时也要让下载线程停下，否则它会一直等着往满了的队列里推数据
+            weakref.finalize(self, download.cancel)
+
+    def _output_spec(self, sps: _hevc.Sps, container: dict[str, int]) -> _native.OutputSpec:
+        """按 SPS 检查输出 RGB 的条件，给出交给 C++ 的输出规格。原生 NV12 输出不做颜色转换，不受这些限制。"""
+        spec = _native.OutputSpec()
+        if self._format == "nv12":
+            return spec
+        spec.rgb = True
+        conflicts = _color_conflicts(sps, container)
+        if conflicts:
+            raise Error("the container and the bitstream disagree on " + "; ".join(conflicts))
+        if not sps.video_full_range_flag:
+            reason = "is limited range (16-235)" if sps.video_signal_type_present else "has no range flag, so it is limited range (16-235) by default"
+            raise UnsupportedError(f"the video {reason}; converting limited range to RGB is not supported yet "
+                                   "(CV-CUDA 0.19 only converts full range). Use format='nv12'")
+        location = (sps.chroma_sample_loc_type_top_field, sps.chroma_sample_loc_type_bottom_field)
+        if location != (0, 0):
+            raise UnsupportedError(f"chroma sample location type {location} is not supported yet for RGB output (only type 0)")
+        if self._colorspace is not None:
+            spec.colorspace = self._colorspace
+        elif sps.matrix_coefficients in _SOURCE_COLORSPACES:
+            spec.colorspace = _SOURCE_COLORSPACES[sps.matrix_coefficients]
+        else:
+            what = "does not specify a matrix (matrix_coefficients 2)" if sps.matrix_coefficients == 2 else \
+                f"uses matrix_coefficients {sps.matrix_coefficients}, which is not supported"
+            raise UnsupportedError(f"the video {what}; pass colorspace={_COLORSPACES[0]!r}, {_COLORSPACES[1]!r} or {_COLORSPACES[2]!r}")
+        left, top, right, bottom = sps.display_area
+        crop_width, crop_height = right - left, bottom - top
+        if self._crop is not None:
+            x, y, w, h = self._crop
+            if x + w > crop_width or y + h > crop_height:
+                raise ValueError(f"crop {self._crop} does not fit the {crop_width}x{crop_height} picture")
+            spec.crop_x, spec.crop_y, spec.crop_width, spec.crop_height = self._crop
+            crop_width, crop_height = w, h
+        target = (crop_width if self._width is None else self._width, crop_height if self._height is None else self._height)
+        if target != (crop_width, crop_height):
+            spec.width, spec.height = target
+            spec.interpolation = _interpolation(self._interpolation, (crop_width, crop_height), target)
+        return spec
+
+    @property
+    def metadata(self) -> VideoMetadata:
+        """录像信息，关闭后仍可读。"""
+        return self._metadata
+
+    @property
+    def decoder_config(self) -> dict[str, Any]:
+        """实际交给 NVDEC 的参数和它报告的原始值。解出第一帧后才有格式、能力和建解码器的参数。"""
+        self._check_open()
+        return self._native.decoder_config()
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """包数、解码次数、交出与选中的帧数、各解码状态的帧数、读取量；远程录像另有请求数和重试次数。"""
+        self._check_open()
+        stats = self._native.stats()
+        if self._download is not None:
+            stats.update(requests=self._download.requests, retries=self._download.retries)
+        return stats
+
+    def __iter__(self) -> Iterator[Frame]:
+        """按显示顺序逐帧返回整段录像，同 frames()。"""
+        return self.frames()
+
+    def frames(self, *, step: int | None = None, fps: float | None = None, source_fps: float | None = None) -> Iterator[Frame]:
+        """按显示顺序逐帧返回整段录像里选中的帧，默认全部。step=k 从第 0 帧起每 k 帧留一帧；fps 与 source_fps 一起给时
+        按 VPF 的 EMDownSampler 从 source_fps 降到 fps（60→30 留第 1、3、5…帧），两种不能同时用。没选中的帧照样解码和检查，
+        但不转换、不交出。每个 VideoReader 只能顺序读一遍。"""
+        self._check_open()
+        sampler = _sampler(step, fps, source_fps)
+        if self._started:
+            raise Error("a VideoReader can only be read sequentially once")
+        self._started = True
+        return self._iterate(repeat(True) if sampler is None else sampler.decisions())
+
+    def _iterate(self, decisions: Iterator[bool]) -> Iterator[Frame]:
+        given = 0
+        while True:
+            self._check_open()
+            item = self._native.next_frame()
+            if item is False:
+                chunk = bytes(1 if keep else 0 for keep in islice(decisions, _SELECTION_CHUNK))
+                if not chunk:
+                    raise Error(f"the sampler gave no decision for frame {given}")
+                self._native.add_selection(chunk)
+                given += len(chunk)
+                continue
+            if item is None:
+                return
+            image, info = item
+            yield Frame(image=image, **info)
+
+    def get_frames_at(self, frames: list[int]) -> Any:
+        """按帧号列表读，保持列表的顺序和重复项，返回 FrameBatch：images 为 [帧数, 高, 宽, 3]，
+        其余属性与 Frame 同名、按帧排列。"""
+        raise UnsupportedError("reading by frame number is not implemented yet")
+
+    def submit(self, frames: list[int]) -> Any:
+        """get_frames_at() 的异步版本，返回可取结果或取消的请求句柄。"""
+        raise UnsupportedError("asynchronous requests are not implemented yet")
+
+    def close(self) -> None:
+        """停止下载，释放解码器和显存。已经交出的帧仍然有效。"""
+        if not self._closed:
+            self._closed = True
+            if self._download is not None:
+                self._download.close()
+            self._native.close()
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise Error("video is closed")
+
+    def __enter__(self) -> VideoReader:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def read_sample(
+    sample_index: Any,
+    video_index: Any,
+    root: str | os.PathLike[str],
+    *,
+    step: int | None = None,
+    fps: float | None = None,
+    source_fps: float | None = None,
+    device: int = 0,
+    crop: tuple[int, int, int, int] | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    interpolation: str | None = None,
+    colorspace: str | None = None,
+    format: str = "rgb24",
+    storage_options: dict[str, Any] | None = None,
+) -> Any:
+    """按样本索引读帧（格式见 docs/index-format.md）：在 root 下打开样本的录像，对样本的帧号列表按 step 或 fps 选帧后读取，返回值同 VideoReader.get_frames_at。"""
+    raise UnsupportedError("reading by sample index is not implemented yet")
