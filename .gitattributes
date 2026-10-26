@@ -1,0 +1,2 @@
+# 源码要传到 DSW 上构建，工作区统一用 LF，不随本机的 core.autocrlf 改成 CRLF
+* text=auto eol=lf

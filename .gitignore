@@ -1,0 +1,10 @@
+# 本地临时数据：下载的样本与源码、实验与测试结果、中间文件
+tmp/
+# 凭证等本机配置；给 Claude Code 的说明也不进版本库
+.env
+CLAUDE.md
+# 构建产物与 Python 环境
+build/
+.venv/
+__pycache__/
+*.egg-info/
