@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/vidlo.svg" width="128" alt="vidlo">
+  <img src="docs/assets/vidlo.png" width="128" alt="vidlo">
 </p>
 
 <h1 align="center">vidlo</h1>
