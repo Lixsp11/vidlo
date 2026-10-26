@@ -9,11 +9,11 @@ mkdir -p "$WORK"
 
 source "$ROOT/ci/common.sh"
 
-# CUDA 12.8：编 CV-CUDA 用的 nvcc 与静态 cudart，cuda.h 与 libcuda 的链接用占位库。CV-CUDA 无条件链接
+# CUDA 12.8：编 CV-CUDA 用的 nvcc、静态 cudart 与 NVTX 头文件，cuda.h 与 libcuda 的链接用占位库。CV-CUDA 无条件链接
 # cusolver、cublas 的静态库（CMake 目标不存在就报错），只编两个算子时用不到其中的符号，不会链进产物
 dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-driver-devel-12-8 libcusolver-devel-12-8 libcublas-devel-12-8
+dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-driver-devel-12-8 cuda-nvtx-12-8 libcusolver-devel-12-8 libcublas-devel-12-8
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 
 # FFmpeg 7.1.5：只用于解封装，参数与 DSW 上验证过的最小 LGPL 构建相同
