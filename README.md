@@ -36,7 +36,7 @@ pip install vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl            # local f
 pip install "vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl[s3,oss]"  # plus R2/S3 and OSS
 ```
 
-CV-CUDA is not bundled: pip installs it from PyPI as the `cvcuda-cu12` dependency. Needs an NVIDIA GPU with NVDEC and driver 570 or newer. In containers, `NVIDIA_DRIVER_CAPABILITIES` must include `video`.
+Needs an NVIDIA GPU from Turing on (the bundled CV-CUDA is built for sm_75, 80, 86, 89, 90, 100 and 120) with driver 570 or newer. In containers, `NVIDIA_DRIVER_CAPABILITIES` must include `video`.
 
 ## Usage
 
@@ -56,7 +56,7 @@ See [docs/api.md](docs/api.md) for every option and [docs/index-format.md](docs/
 | | |
 | --- | --- |
 | [NVIDIA Video Codec SDK 13.0](https://developer.nvidia.com/video-codec-sdk) (NVDEC) | hardware HEVC decoding |
-| [CV-CUDA 0.19](https://github.com/CVCUDA/CV-CUDA) | crop, color conversion and resize on the GPU |
+| [CV-CUDA 0.19](https://github.com/CVCUDA/CV-CUDA) | crop, color conversion and resize on the GPU; built from source with only the operators vidlo uses |
 | [FFmpeg 7.1](https://ffmpeg.org/) (libavformat, LGPL build) | demuxing |
 | [pybind11](https://github.com/pybind/pybind11) · [scikit-build-core](https://github.com/scikit-build/scikit-build-core) | Python bindings and build |
 | [boto3](https://github.com/boto/boto3) · [alibabacloud-oss-v2](https://github.com/aliyun/alibabacloud-oss-python-sdk-v2) | object storage |

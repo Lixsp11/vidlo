@@ -1,25 +1,20 @@
 #!/bin/bash
 # cibuildwheel 的 before-all：在 manylinux_2_28 容器（AlmaLinux 8）里准备构建 vidlo 需要的依赖，都装到 /opt 下。
-# 版本与本地开发构建相同：CUDA 12.8、FFmpeg 7.1.5 最小 LGPL 构建、CV-CUDA 0.19.0、Video Codec SDK 13.0 的头文件。
+# 版本与本地开发构建相同：CUDA 12.8、FFmpeg 7.1.5 最小 LGPL 构建、CV-CUDA 0.19.0（ci/build_cvcuda.sh）、Video Codec SDK 13.0 的头文件。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=/tmp/vidlo-deps
 mkdir -p "$WORK"
 
-download() {  # url 文件 sha256；curl 的 --retry 不重试 TLS 握手失败（退出码 35）这类连接错误，这里自己重试
-  for attempt in 1 2 3 4 5; do
-    curl -fsSL -o "$2" "$1" && break
-    [ "$attempt" = 5 ] && return 1
-    sleep $((attempt * 10))
-  done
-  echo "$3  $2" | sha256sum -c -
-}
+source "$ROOT/ci/common.sh"
 
-# CUDA 12.8：cuda.h 与 libcuda 的链接用占位库、cuda_runtime.h（CV-CUDA 的头文件引用它），以及 CMake 判断 CUDA 版本用的 nvcc
+# CUDA 12.8：编 CV-CUDA 用的 nvcc 与静态 cudart，cuda.h 与 libcuda 的链接用占位库。CV-CUDA 无条件链接
+# cusolver、cublas 的静态库（CMake 目标不存在就报错），只编两个算子时用不到其中的符号，不会链进产物
 dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-driver-devel-12-8
+dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-driver-devel-12-8 libcusolver-devel-12-8 libcublas-devel-12-8
+export PATH=/usr/local/cuda-12.8/bin:$PATH
 
 # FFmpeg 7.1.5：只用于解封装，参数与 DSW 上验证过的最小 LGPL 构建相同
 download https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz "$WORK/ffmpeg.tar.xz" \
@@ -35,14 +30,7 @@ tar xJf "$WORK/ffmpeg.tar.xz" -C "$WORK"
   make install
 )
 
-# CV-CUDA 0.19.0（CUDA 12）：头文件用 GitHub 发布的开发包（解压后在 /opt/nvidia/cvcuda0/include）；
-# 链接用运行时依赖的 cvcuda-cu12 wheel 里的库，解压到 /opt/cvcuda_cu12/cvcuda_cu12.libs
-download https://github.com/CVCUDA/CV-CUDA/releases/download/v0.19.0/cvcuda-dev-0.19.0-cuda12-x86_64-linux.tar.xz \
-  "$WORK/cvcuda-dev.tar.xz" abb71db72a908930a92ab6c60936621365380d3c255f84a53bd2224335d9784b
-tar xJf "$WORK/cvcuda-dev.tar.xz" -C /
-download https://files.pythonhosted.org/packages/bd/8d/24707d63b28076590c672769a44a9a79d061183d3190b730370bbd3b4a66/cvcuda_cu12-0.19.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
-  "$WORK/cvcuda_cu12.whl" 16640219c25d1a2f926c8e00babe8d68bde6c76c3dff95a0a09b86dc46e5d653
-/opt/python/cp312-cp312/bin/python -m zipfile -e "$WORK/cvcuda_cu12.whl" /opt/cvcuda_cu12
+bash "$ROOT/ci/build_cvcuda.sh" /opt/cvcuda "$WORK/cvcuda"
 
 # Video Codec SDK：仓库里只带两个 MIT 许可的头文件；链接用的 libnvcuvid 占位库在这里编，目录结构同 SDK
 mkdir -p /opt/nvsdk/Interface /opt/nvsdk/Lib/linux/stubs/x86_64

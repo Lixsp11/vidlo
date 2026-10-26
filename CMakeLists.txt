@@ -8,10 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(VIDLO_FFMPEG_ROOT "" CACHE PATH "FFmpeg 安装目录，含 include/ 与 lib/")
 set(VIDLO_NVSDK_ROOT "" CACHE PATH "Video Codec SDK 根目录，含 Interface/ 与 Lib/")
 set(VIDLO_NVSDK_VERSION "13.0.37" CACHE STRING "Video Codec SDK 版本，记进解码配置快照")
-set(VIDLO_CVCUDA_ROOT "" CACHE PATH "CV-CUDA 0.19.0 开发包的解压目录，用其中的 include/")
-set(VIDLO_CVCUDA_LIBS "" CACHE PATH "cvcuda-cu12 0.19.0 的 cvcuda_cu12.libs 目录，运行时也用这个包的库")
-if(NOT VIDLO_FFMPEG_ROOT OR NOT VIDLO_NVSDK_ROOT OR NOT VIDLO_CVCUDA_ROOT OR NOT VIDLO_CVCUDA_LIBS)
-  message(FATAL_ERROR "VIDLO_FFMPEG_ROOT, VIDLO_NVSDK_ROOT, VIDLO_CVCUDA_ROOT and VIDLO_CVCUDA_LIBS must be set")
+set(VIDLO_CVCUDA_ROOT "" CACHE PATH "ci/build_cvcuda.sh 编出的 CV-CUDA 0.19.0 安装目录，含 include/ 与 lib/")
+if(NOT VIDLO_FFMPEG_ROOT OR NOT VIDLO_NVSDK_ROOT OR NOT VIDLO_CVCUDA_ROOT)
+  message(FATAL_ERROR "VIDLO_FFMPEG_ROOT, VIDLO_NVSDK_ROOT and VIDLO_CVCUDA_ROOT must be set")
 endif()
 
 find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
@@ -21,14 +20,12 @@ find_package(CUDAToolkit 12.2 REQUIRED)
 foreach(lib avformat avcodec avutil)
   find_library(VIDLO_LIB_${lib} ${lib} PATHS "${VIDLO_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 endforeach()
-# cvcuda-cu12 的库名带 auditwheel 加的哈希（如 libcvcuda-4e720cbb.so.0.19.0），soname 也是这个名字
+# CV-CUDA 把库装在 lib/${CMAKE_LIBRARY_ARCHITECTURE}：Ubuntu 上是 lib/x86_64-linux-gnu，manylinux 容器里就是 lib
 foreach(lib cvcuda nvcv_types)
-  file(GLOB VIDLO_LIB_${lib} "${VIDLO_CVCUDA_LIBS}/lib${lib}-*.so.0.19.0")
-  list(LENGTH VIDLO_LIB_${lib} count)
-  if(NOT count EQUAL 1)
-    message(FATAL_ERROR "expected one lib${lib}-*.so.0.19.0 in ${VIDLO_CVCUDA_LIBS}, found: ${VIDLO_LIB_${lib}}")
-  endif()
+  find_library(VIDLO_LIB_${lib} ${lib} PATHS "${VIDLO_CVCUDA_ROOT}/lib" PATH_SUFFIXES "${CMAKE_LIBRARY_ARCHITECTURE}"
+    NO_DEFAULT_PATH REQUIRED)
 endforeach()
+get_filename_component(VIDLO_CVCUDA_LIBDIR "${VIDLO_LIB_cvcuda}" DIRECTORY)
 # 链接用 SDK 的 stub，运行时加载驱动自带的 libnvcuvid.so.1
 find_library(VIDLO_LIB_nvcuvid nvcuvid PATHS "${VIDLO_NVSDK_ROOT}/Lib/linux/stubs/x86_64" NO_DEFAULT_PATH REQUIRED)
 
@@ -39,14 +36,14 @@ target_include_directories(_native PRIVATE "${VIDLO_FFMPEG_ROOT}/include" "${VID
   "${VIDLO_CVCUDA_ROOT}/include" ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(_native PRIVATE VIDLO_NVSDK_VERSION="${VIDLO_NVSDK_VERSION}")
 target_compile_options(_native PRIVATE -Wall -Wextra)
-# FFmpeg 的库都写进 NEEDED，由本模块的 RUNPATH 找到：libavformat 自己没有搜索路径，若 --as-needed 去掉了 libavutil，
-# 它的依赖会找不到。发布的 wheel 由 auditwheel 把 FFmpeg 改名后拷进包里、改用 $ORIGIN 查找（pyproject.toml 的
-# [tool.cibuildwheel]）。CV-CUDA 不打包，用同一个 site-packages 里依赖包 cvcuda-cu12 的库。
+# 开发构建：FFmpeg 与 CV-CUDA 的库都写进 NEEDED，由本模块的 RUNPATH 找到；libavformat 自己没有搜索路径，
+# 若 --as-needed 去掉了 libavutil，它的依赖会找不到。发布的 wheel 由 auditwheel 把这些库改名后拷进包里、
+# 改用 $ORIGIN 查找（pyproject.toml 的 [tool.cibuildwheel]）。
 target_link_libraries(_native PRIVATE CUDA::cuda_driver "${VIDLO_LIB_nvcuvid}"
   -Wl,--no-as-needed "${VIDLO_LIB_avformat}" "${VIDLO_LIB_avcodec}" "${VIDLO_LIB_avutil}"
   "${VIDLO_LIB_cvcuda}" "${VIDLO_LIB_nvcv_types}" -Wl,--as-needed)
 set_target_properties(_native PROPERTIES
-  BUILD_RPATH "${VIDLO_FFMPEG_ROOT}/lib;${VIDLO_CVCUDA_LIBS}"
-  INSTALL_RPATH "${VIDLO_FFMPEG_ROOT}/lib;$ORIGIN/../cvcuda_cu12.libs")
+  BUILD_RPATH "${VIDLO_FFMPEG_ROOT}/lib;${VIDLO_CVCUDA_LIBDIR}"
+  INSTALL_RPATH "${VIDLO_FFMPEG_ROOT}/lib;${VIDLO_CVCUDA_LIBDIR}")
 
 install(TARGETS _native DESTINATION vidlo)
