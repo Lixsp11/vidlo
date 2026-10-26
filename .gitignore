@@ -3,8 +3,9 @@ tmp/
 # 凭证等本机配置；给 Claude Code 的说明也不进版本库
 .env
 CLAUDE.md
-# 构建产物与 Python 环境
+# 构建产物与 Python 环境；dist/ 不忽略的话 sdist 会把打好的 wheel 也收进去
 build/
+dist/
 .venv/
 __pycache__/
 *.egg-info/
