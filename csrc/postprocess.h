@@ -39,17 +39,23 @@ class FrameProcessor {
   // surface 映射期间调用：提交裁剪区域的复制，不等待。surface 要等 produce 返回（已同步）后才能归还。
   // surface_height 是 surface 里亮度的行数（色度紧随其后）
   void copy_in(CUdeviceptr frame, unsigned pitch, unsigned surface_height, CUstream stream);
-  // 颜色转换、缩放，复制到内存，同步后返回。RGB 为 [高, 宽, 3]；NV12 为 [高×3/2, 宽]
+  // 颜色转换、缩放，复制到内存，同步后返回。RGB 为 [高, 宽, 3]；NV12 为 [高×3/2, 宽]。
+  // 给了 out 就写进那里（output_bytes() 字节），否则返回新分配的一份
   std::vector<uint8_t> produce(CUstream stream);
+  void produce(CUstream stream, uint8_t* out);
 
   int output_width() const { return output_width_; }
   int output_height() const { return output_height_; }
+  size_t output_bytes() const;
   bool rgb() const { return spec_.rgb; }
   const std::string& colorspace() const { return spec_.colorspace; }
   const std::string& interpolation() const { return interpolation_; }  // 实际用的插值；不缩放时为空
 
  private:
   struct Gpu;  // CV-CUDA 的算子与包装好的 tensor，只在 postprocess.cpp 里用到它们的头文件
+
+  // 转换、缩放、复制到锁页内存并同步，返回锁页内存
+  const void* to_host(CUstream stream);
 
   OutputSpec spec_;
   int left_ = 0;  // 裁剪区域在 surface 里的位置

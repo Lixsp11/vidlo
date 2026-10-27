@@ -220,12 +220,18 @@ void NvdecSession::keep_decoder() {
   keep_decoder_ = cache_decoder_ && hardware_ != nullptr;
 }
 
-void NvdecSession::set_targets(const std::vector<int64_t>& timestamps) {
+void NvdecSession::set_targets(const std::vector<int64_t>& timestamps, const std::vector<uint8_t*>& destinations, size_t frame_bytes) {
   if (stats_.packets != 0 || !selection_.empty()) {
     throw Error("set_targets must come before any packet or selection");
   }
+  if (!destinations.empty() && destinations.size() != timestamps.size()) {
+    throw Error("set_targets needs one destination per timestamp");
+  }
   by_timestamp_ = true;
-  targets_.insert(timestamps.begin(), timestamps.end());
+  frame_bytes_ = frame_bytes;
+  for (size_t i = 0; i < timestamps.size(); ++i) {
+    targets_.emplace(timestamps[i], destinations.empty() ? nullptr : destinations[i]);
+  }
 }
 
 void NvdecSession::parse(CUVIDSOURCEDATAPACKET& packet) {
@@ -419,8 +425,13 @@ int NvdecSession::handle_display(const CUVIDPARSERDISPINFO* display) {
     throw UnsupportedError("interlaced frames are not supported yet");
   }
   bool keep;
+  uint8_t* destination = nullptr;
   if (by_timestamp_) {
-    keep = targets_.count(display->timestamp) != 0;
+    const auto target = targets_.find(display->timestamp);
+    keep = target != targets_.end();
+    if (keep) {
+      destination = target->second;
+    }
   } else {
     if (selection_.empty()) {
       throw Error("no selection decision for the displayed frame (caller did not keep the selection reserve)");
@@ -470,9 +481,17 @@ int NvdecSession::handle_display(const CUVIDPARSERDISPINFO* display) {
   if (keep) {
     // 色度紧跟在整个 surface 的亮度之后：surface 高度是编码高度（b1 为 736），不是显示高度
     const auto surface_height = static_cast<unsigned>((snapshot_.create.ulTargetHeight + 1) & ~1ul);
+    if (destination != nullptr && processor_->output_bytes() != frame_bytes_) {
+      throw Error("output frame is " + std::to_string(processor_->output_bytes()) + " bytes but the destination holds " +
+                  std::to_string(frame_bytes_));
+    }
     try {
       processor_->copy_in(frame, pitch, surface_height, stream_);
-      out.image = processor_->produce(stream_);
+      if (destination != nullptr) {
+        processor_->produce(stream_, destination);
+      } else {
+        out.image = processor_->produce(stream_);
+      }
     } catch (...) {
       cuStreamSynchronize(stream_);  // 已提交的复制和处理可能还在读 surface、写锁页内存：等它们结束再归还
       throw;

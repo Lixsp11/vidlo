@@ -12,6 +12,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -24,8 +25,8 @@ namespace vidlo {
 struct DecodedFrame {
   int64_t timestamp = 0;  // 提交包时附带的值，由显示回调按显示顺序带回
   int decode_status = 0;  // cuvidDecodeStatus
-  bool kept = false;      // 是否选中；只有选中的帧做后处理，image 才有内容
-  std::vector<uint8_t> image;  // FrameProcessor::produce 的结果
+  bool kept = false;      // 是否选中；只有选中的帧做后处理
+  std::vector<uint8_t> image;  // FrameProcessor::produce 的结果；选中的帧写到了 set_targets 给的位置时为空
 };
 
 // 每次 cuvidDecodePicture 一项，按解码顺序，用于核对容器的关键帧标记
@@ -64,7 +65,8 @@ struct DecoderStats {
 // - 顺序读：调用方事先按显示顺序给出（add_selection）。一次 feed 或 finish 交出的帧不会多于解码 surface 数，
 //   调用方在 feed、finish 之前保证 selection_pending() 不少于 kSelectionReserve。
 // - 按帧号读：送包时的时间戳就是帧号，set_targets 给出要的帧号，显示回调按时间戳挑。不能按显示位置数：
-//   显示在目标之前、解码顺序在区间之外的 B 帧根本没送进来，位置会错开。
+//   显示在目标之前、解码顺序在区间之外的 B 帧根本没送进来，位置会错开。set_targets 同时给出每帧的写入位置时，
+//   后处理的结果直接写到那里（调用方按请求一次分配好最终的数组），不另分配。
 // cache_decoder 为真时，硬件解码器先从 DecoderCache 取；会话正常结束、调用方核对无误后调用 keep_decoder()，析构时放回缓存，
 // 否则销毁。parser、码流状态、后处理都随会话新建。
 class NvdecSession {
@@ -82,7 +84,9 @@ class NvdecSession {
   std::vector<PictureInfo> take_pictures();  // 取走上次以来解码的图像信息
   void add_selection(const std::vector<bool>& keep);  // 接下来按显示顺序各帧是否选中
   size_t selection_pending() const { return selection_.size(); }
-  void set_targets(const std::vector<int64_t>& timestamps);  // 改为按时间戳选帧，送包之前调用
+  // 改为按时间戳选帧，送包之前调用。destinations 不为空时与 timestamps 一一对应，每处 frame_bytes 字节，
+  // 必须等于后处理的输出大小；调用方保证这些内存在会话结束前有效
+  void set_targets(const std::vector<int64_t>& timestamps, const std::vector<uint8_t*>& destinations = {}, size_t frame_bytes = 0);
   void keep_decoder();  // finish() 成功之后调用：析构时把硬件解码器放回缓存
   bool reused_decoder() const { return reused_decoder_; }  // 硬件解码器是不是从缓存取的
 
@@ -126,7 +130,8 @@ class NvdecSession {
   std::unique_ptr<FrameProcessor> processor_;  // 显存在建解码器时分配，在 release() 里持有 context 时释放
   std::deque<bool> selection_;
   bool by_timestamp_ = false;  // set_targets 之后按时间戳选帧
-  std::unordered_set<int64_t> targets_;
+  std::unordered_map<int64_t, uint8_t*> targets_;  // 要的帧号 → 写入位置（没给位置时为空指针）
+  size_t frame_bytes_ = 0;
   std::deque<DecodedFrame> frames_;
   std::vector<PictureInfo> pictures_;
   DecoderSnapshot snapshot_;
