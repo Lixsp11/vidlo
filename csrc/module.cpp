@@ -1,4 +1,4 @@
-// Python 绑定：输入（本地文件、下载流）、输出规格和顺序解码这一层；接口形状和参数检查在 src/vidlo/ 的 Python 代码里。
+// Python 绑定：输入（本地文件、下载流）、输出规格、顺序解码和按帧号解码这一层；接口形状和参数检查在 src/vidlo/ 的 Python 代码里。
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -13,6 +13,7 @@
 
 #include "demuxer.h"
 #include "error.h"
+#include "indexed_decoder.h"
 #include "input.h"
 #include "nvdec.h"
 #include "postprocess.h"
@@ -96,6 +97,48 @@ py::dict caps_dict(const CUVIDDECODECAPS& c) {
   d["nCounterBitDepth"] = c.nCounterBitDepth;
   d["nMaxHistogramBins"] = c.nMaxHistogramBins;
   return d;
+}
+
+py::dict create_dict(const CUVIDDECODECREATEINFO& c);
+
+py::dict snapshot_dict(const DecoderSnapshot& s) {
+  py::dict d;
+  d["driver_version"] = s.driver_version;
+  d["device"] = s.device;
+  d["device_name"] = s.device_name;
+  d["device_uuid"] = s.device_uuid;
+  d["sdk_headers"] = VIDLO_NVSDK_VERSION;  // 头文件里没有版本宏，由构建时传入
+  d["parser"] = parser_dict(s.parser);
+  d["sequence_calls"] = s.sequence_calls;
+  if (s.has_format) {
+    d["format"] = format_dict(s.format);
+    d["caps"] = caps_dict(s.caps);
+    d["create"] = create_dict(s.create);
+  }
+  return d;
+}
+
+py::dict status_dict(const std::array<int64_t, 16>& counts) {
+  py::dict status;
+  for (size_t i = 0; i < counts.size(); ++i) {
+    if (counts[i] != 0) {
+      status[py::int_(i)] = counts[i];
+    }
+  }
+  return status;
+}
+
+// 交出的画面：数组直接用这块内存，由 capsule 持有，不再复制。RGB 为 [高, 宽, 3]，NV12 为 [高×3/2, 宽]
+py::array_t<uint8_t> image_array(std::vector<uint8_t>&& image, int width, int height, bool rgb) {
+  auto* buffer = new std::vector<uint8_t>(std::move(image));
+  py::capsule owner(buffer, [](void* p) { delete static_cast<std::vector<uint8_t>*>(p); });
+  const auto w = static_cast<py::ssize_t>(width);
+  const auto h = static_cast<py::ssize_t>(height);
+  if (rgb) {
+    return py::array_t<uint8_t>({h, w, static_cast<py::ssize_t>(3)}, {w * 3, static_cast<py::ssize_t>(3), static_cast<py::ssize_t>(1)},
+                                buffer->data(), owner);
+  }
+  return py::array_t<uint8_t>({h * 3 / 2, w}, {w, static_cast<py::ssize_t>(1)}, buffer->data(), owner);
 }
 
 py::dict create_dict(const CUVIDDECODECREATEINFO& c) {
@@ -238,17 +281,7 @@ class SequentialDecoder {
       return py::none();
     }
     const FrameProcessor& processor = session_->processor();
-    const auto height = static_cast<py::ssize_t>(processor.output_height());
-    const auto width = static_cast<py::ssize_t>(processor.output_width());
-    auto* buffer = new std::vector<uint8_t>(std::move(frame.image));
-    py::capsule owner(buffer, [](void* p) { delete static_cast<std::vector<uint8_t>*>(p); });
-    py::array_t<uint8_t> image;
-    if (processor.rgb()) {
-      image = py::array_t<uint8_t>({height, width, static_cast<py::ssize_t>(3)}, {width * 3, static_cast<py::ssize_t>(3), static_cast<py::ssize_t>(1)},
-                                   buffer->data(), owner);
-    } else {
-      image = py::array_t<uint8_t>({height * 3 / 2, width}, {width, static_cast<py::ssize_t>(1)}, buffer->data(), owner);
-    }
+    py::array_t<uint8_t> image = image_array(std::move(frame.image), processor.output_width(), processor.output_height(), processor.rgb());
     py::dict meta;
     meta["number"] = identity.number;
     meta["pts"] = identity.pts;
@@ -383,23 +416,7 @@ class SequentialDecoder {
     }
   }
 
-  py::dict decoder_config_dict() const {
-    const DecoderSnapshot& s = session_->snapshot();
-    py::dict d;
-    d["driver_version"] = s.driver_version;
-    d["device"] = s.device;
-    d["device_name"] = s.device_name;
-    d["device_uuid"] = s.device_uuid;
-    d["sdk_headers"] = VIDLO_NVSDK_VERSION;  // 头文件里没有版本宏，由构建时传入
-    d["parser"] = parser_dict(s.parser);
-    d["sequence_calls"] = s.sequence_calls;
-    if (s.has_format) {
-      d["format"] = format_dict(s.format);
-      d["caps"] = caps_dict(s.caps);
-      d["create"] = create_dict(s.create);
-    }
-    return d;
-  }
+  py::dict decoder_config_dict() const { return snapshot_dict(session_->snapshot()); }
 
   py::dict stats_dict() const {
     const DecoderStats& s = session_->stats();
@@ -409,13 +426,7 @@ class SequentialDecoder {
     d["displayed"] = s.displayed;
     d["kept"] = s.kept;
     d["end_of_stream"] = s.end_of_stream;
-    py::dict status;
-    for (size_t i = 0; i < s.status_counts.size(); ++i) {
-      if (s.status_counts[i] != 0) {
-        status[py::int_(i)] = s.status_counts[i];
-      }
-    }
-    d["decode_status_counts"] = status;
+    d["decode_status_counts"] = status_dict(s.status_counts);
     const InputStats& input = demuxer_->input_stats();
     d["bytes_read"] = input.bytes_read;
     d["seeks"] = input.seeks;
@@ -442,6 +453,64 @@ class SequentialDecoder {
   int64_t last_pts_ = 0;
   int64_t next_number_ = 0;  // 下一个显示的帧的帧号，不论是否选中
 };
+
+using Int64Array = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
+
+// 按帧号读的一次请求。packets 为 [n, 4]，按解码顺序每行是 (packet_start, packet_end, 帧号, 是否 GOP 入口)；targets 为要的帧号。
+// 返回按帧号升序的 [(帧号, 画面, 解码状态), ...]
+py::list read_indexed(IndexedDecoder& self, int64_t range_start, int64_t range_end, const Int64Array& packets, const Int64Array& targets) {
+  if (packets.ndim() != 2 || packets.shape(1) != 4 || targets.ndim() != 1) {
+    throw Error("packets must have shape [n, 4] and targets must be one-dimensional");
+  }
+  const auto rows = packets.unchecked<2>();
+  std::vector<IndexedPacket> list(static_cast<size_t>(packets.shape(0)));
+  for (py::ssize_t i = 0; i < packets.shape(0); ++i) {
+    list[static_cast<size_t>(i)] = {rows(i, 0), rows(i, 1), rows(i, 2), rows(i, 3) != 0};
+  }
+  const std::vector<int64_t> wanted(targets.data(), targets.data() + targets.size());
+  std::vector<IndexedFrame> frames;
+  {
+    py::gil_scoped_release release;
+    frames = self.read(range_start, range_end, list, wanted);
+  }
+  py::list out;
+  for (IndexedFrame& frame : frames) {
+    out.append(py::make_tuple(frame.number, image_array(std::move(frame.image), self.output_width(), self.output_height(), self.rgb()),
+                              frame.decode_status));
+  }
+  return out;
+}
+
+py::dict indexed_stats(const IndexedDecoder& self) {
+  const IndexedStats& s = self.stats();
+  py::dict d;
+  d["requests"] = s.requests;
+  d["bytes_read"] = s.bytes_read;
+  d["read_calls"] = s.read_calls;
+  d["packets"] = s.packets;
+  d["decode_calls"] = s.decode_calls;
+  d["displayed"] = s.displayed;
+  d["kept"] = s.kept;
+  d["skipped"] = s.skipped;
+  d["decoder_reuses"] = s.decoder_reuses;
+  d["decoder_creations"] = s.decoder_creations;
+  d["decode_status_counts"] = status_dict(s.status_counts);
+  d["last_range"] = s.requests == 0 ? py::object(py::none()) : py::object(py::make_tuple(s.last_range_start, s.last_range_end));
+  return d;
+}
+
+py::dict decoder_cache_dict() {
+  const DecoderCache& cache = DecoderCache::instance();
+  const DecoderCacheStats s = cache.stats();
+  py::dict d;
+  d["capacity"] = cache.capacity();
+  d["idle"] = cache.idle();
+  d["hits"] = s.hits;
+  d["misses"] = s.misses;
+  d["returned"] = s.returned;
+  d["evicted"] = s.evicted;
+  return d;
+}
 
 }  // namespace
 }  // namespace vidlo
@@ -498,4 +567,25 @@ PYBIND11_MODULE(_native, m) {
       .def("decoder_config", &vidlo::SequentialDecoder::decoder_config)
       .def("stats", &vidlo::SequentialDecoder::stats)
       .def("close", &vidlo::SequentialDecoder::close);
+
+  py::class_<vidlo::IndexedDecoder>(m, "IndexedDecoder")
+      .def(py::init([](std::shared_ptr<vidlo::Input> input, const py::bytes& codec_config, int device, const vidlo::OutputSpec& output,
+                       bool skip_unreferenced) {
+             const std::string_view config = codec_config;
+             return std::make_unique<vidlo::IndexedDecoder>(std::move(input), std::vector<uint8_t>(config.begin(), config.end()), device,
+                                                            output, skip_unreferenced);
+           }),
+           py::arg("input"), py::arg("codec_config"), py::arg("device"), py::arg("output"), py::arg("skip_unreferenced") = true)
+      .def("read", &vidlo::read_indexed, py::arg("range_start"), py::arg("range_end"), py::arg("packets"), py::arg("targets"))
+      .def("stats", &vidlo::indexed_stats)
+      // 解出第一批帧之前还没有解码配置
+      .def("decoder_config",
+           [](const vidlo::IndexedDecoder& self) { return self.has_snapshot() ? vidlo::snapshot_dict(self.snapshot()) : py::dict(); })
+      .def("close", &vidlo::IndexedDecoder::close);
+
+  // 进程级的空闲硬件解码器缓存（按帧号读用），按设备计容量，默认 1；0 关闭并销毁现有的
+  m.def("set_decoder_cache_capacity", [](size_t capacity) { vidlo::DecoderCache::instance().set_capacity(capacity); },
+        py::arg("capacity"), py::call_guard<py::gil_scoped_release>());
+  m.def("clear_decoder_cache", []() { vidlo::DecoderCache::instance().clear(); }, py::call_guard<py::gil_scoped_release>());
+  m.def("decoder_cache_stats", &vidlo::decoder_cache_dict);
 }
