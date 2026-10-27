@@ -5,6 +5,7 @@
 
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -457,10 +458,42 @@ class SequentialDecoder {
 using Int64Array = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
 
 // 按帧号读的一次请求。packets 为 [n, 4]，按解码顺序每行是 (packet_start, packet_end, 帧号, 是否 GOP 入口)；targets 为要的帧号。
-// 返回按帧号升序的 [(帧号, 画面, 解码状态), ...]
-py::list read_indexed(IndexedDecoder& self, int64_t range_start, int64_t range_end, const Int64Array& packets, const Int64Array& targets) {
+// out 是调用方按请求分配好的最终数组 [帧数, ...]，slots[i] 是 targets[i] 写进 out 的第几项（重复的帧号由调用方复制）。
+// data 为 None 时从本地文件读这段字节；对象存储时是已经取到的这段字节。out 与 data 在调用期间由调用方持有，释放 GIL 后照样有效。
+// 返回按帧号升序的 [(帧号, 解码状态), ...]
+py::list read_indexed(IndexedDecoder& self, int64_t range_start, int64_t range_end, const Int64Array& packets, const Int64Array& targets,
+                      py::array& out, const Int64Array& slots, const py::object& data) {
   if (packets.ndim() != 2 || packets.shape(1) != 4 || targets.ndim() != 1) {
     throw Error("packets must have shape [n, 4] and targets must be one-dimensional");
+  }
+  if (!out.dtype().is(py::dtype::of<uint8_t>()) || !(out.flags() & py::array::c_style) || !out.writeable() || out.ndim() < 2 ||
+      out.shape(0) == 0) {
+    throw Error("out must be a writable, C-contiguous uint8 array with one entry per requested frame");
+  }
+  if (slots.ndim() != 1 || slots.size() != targets.size()) {
+    throw Error("slots must give one position in out for each target");
+  }
+  const auto count = out.shape(0);
+  const auto frame_bytes = static_cast<size_t>(out.nbytes() / count);
+  auto* base = static_cast<uint8_t*>(out.mutable_data());
+  std::vector<uint8_t*> destinations;
+  std::vector<bool> used(static_cast<size_t>(count), false);
+  for (py::ssize_t i = 0; i < slots.size(); ++i) {
+    const int64_t slot = slots.data()[i];
+    if (slot < 0 || slot >= count || used[static_cast<size_t>(slot)]) {
+      throw Error("slots must be distinct positions in out");
+    }
+    used[static_cast<size_t>(slot)] = true;
+    destinations.push_back(base + static_cast<size_t>(slot) * frame_bytes);
+  }
+  std::optional<py::buffer_info> view;
+  const uint8_t* bytes = nullptr;
+  if (!data.is_none()) {
+    view = py::buffer(data).request();
+    if (view->ndim != 1 || view->itemsize != 1 || view->strides[0] != 1 || view->size != range_end - range_start) {
+      throw Error("data must be contiguous bytes as long as the byte range");
+    }
+    bytes = static_cast<const uint8_t*>(view->ptr);
   }
   const auto rows = packets.unchecked<2>();
   std::vector<IndexedPacket> list(static_cast<size_t>(packets.shape(0)));
@@ -471,20 +504,19 @@ py::list read_indexed(IndexedDecoder& self, int64_t range_start, int64_t range_e
   std::vector<IndexedFrame> frames;
   {
     py::gil_scoped_release release;
-    frames = self.read(range_start, range_end, list, wanted);
+    frames = self.read(range_start, range_end, list, wanted, bytes, destinations, frame_bytes);
   }
-  py::list out;
-  for (IndexedFrame& frame : frames) {
-    out.append(py::make_tuple(frame.number, image_array(std::move(frame.image), self.output_width(), self.output_height(), self.rgb()),
-                              frame.decode_status));
+  py::list result;
+  for (const IndexedFrame& frame : frames) {
+    result.append(py::make_tuple(frame.number, frame.decode_status));
   }
-  return out;
+  return result;
 }
 
 py::dict indexed_stats(const IndexedDecoder& self) {
   const IndexedStats& s = self.stats();
   py::dict d;
-  d["requests"] = s.requests;
+  d["reads"] = s.reads;
   d["bytes_read"] = s.bytes_read;
   d["read_calls"] = s.read_calls;
   d["packets"] = s.packets;
@@ -495,7 +527,7 @@ py::dict indexed_stats(const IndexedDecoder& self) {
   d["decoder_reuses"] = s.decoder_reuses;
   d["decoder_creations"] = s.decoder_creations;
   d["decode_status_counts"] = status_dict(s.status_counts);
-  d["last_range"] = s.requests == 0 ? py::object(py::none()) : py::object(py::make_tuple(s.last_range_start, s.last_range_end));
+  d["last_range"] = s.reads == 0 ? py::object(py::none()) : py::object(py::make_tuple(s.last_range_start, s.last_range_end));
   return d;
 }
 
@@ -576,7 +608,8 @@ PYBIND11_MODULE(_native, m) {
                                                             output, skip_unreferenced);
            }),
            py::arg("input"), py::arg("codec_config"), py::arg("device"), py::arg("output"), py::arg("skip_unreferenced") = true)
-      .def("read", &vidlo::read_indexed, py::arg("range_start"), py::arg("range_end"), py::arg("packets"), py::arg("targets"))
+      .def("read", &vidlo::read_indexed, py::arg("range_start"), py::arg("range_end"), py::arg("packets"), py::arg("targets"),
+           py::arg("out"), py::arg("slots"), py::arg("data") = py::none())
       .def("stats", &vidlo::indexed_stats)
       // 解出第一批帧之前还没有解码配置
       .def("decoder_config",

@@ -41,7 +41,8 @@ void IndexedDecoder::close() {
 }
 
 std::vector<IndexedFrame> IndexedDecoder::read(int64_t range_start, int64_t range_end, const std::vector<IndexedPacket>& packets,
-                                               const std::vector<int64_t>& targets) {
+                                               const std::vector<int64_t>& targets, const uint8_t* data,
+                                               const std::vector<uint8_t*>& destinations, size_t frame_bytes) {
   if (closed_) {
     throw Error("video is closed");
   }
@@ -49,7 +50,7 @@ std::vector<IndexedFrame> IndexedDecoder::read(int64_t range_start, int64_t rang
     throw Error("an earlier error stopped reading this video");
   }
   try {
-    return read_unchecked(range_start, range_end, packets, targets);
+    return read_unchecked(range_start, range_end, packets, targets, data, destinations, frame_bytes);
   } catch (...) {
     failed_ = true;
     throw;
@@ -58,12 +59,19 @@ std::vector<IndexedFrame> IndexedDecoder::read(int64_t range_start, int64_t rang
 
 std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, int64_t range_end,
                                                          const std::vector<IndexedPacket>& packets,
-                                                         const std::vector<int64_t>& targets) {
+                                                         const std::vector<int64_t>& targets, const uint8_t* data,
+                                                         const std::vector<uint8_t*>& destinations, size_t frame_bytes) {
   // 请求由 Python 层按索引规划，这里只核对它自洽：包按解码顺序首尾相接地落在区间里，要的帧都在这些包里
   if (packets.empty() || targets.empty()) {
     throw Error("empty request");
   }
-  if (range_start < 0 || range_start >= range_end || range_end > input_->size()) {
+  if (range_start < 0 || range_start >= range_end) {
+    throw Error("invalid byte range [" + std::to_string(range_start) + ", " + std::to_string(range_end) + ")");
+  }
+  if (data == nullptr && input_ == nullptr) {
+    throw Error("no input to read the byte range from");
+  }
+  if (data == nullptr && range_end > input_->size()) {
     throw Error("byte range [" + std::to_string(range_start) + ", " + std::to_string(range_end) + ") does not fit the " +
                 std::to_string(input_->size()) + "-byte file");
   }
@@ -93,23 +101,29 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
       throw Error("requested frame " + std::to_string(number) + " is not among the decoded packets");
     }
   }
-
-  // 一次读出整个区间；本地文件 pread 可能分几次返回
-  std::vector<uint8_t> bytes(static_cast<size_t>(range_end - range_start));
-  size_t done = 0;
-  int64_t calls = 0;
-  while (done < bytes.size()) {
-    const size_t n = input_->read(range_start + static_cast<int64_t>(done), bytes.data() + done, bytes.size() - done);
-    ++calls;
-    if (n == 0) {
-      throw Error("the file ends at byte " + std::to_string(range_start + static_cast<int64_t>(done)) +
-                  ", before the end of the range " + std::to_string(range_end));
-    }
-    done += n;
+  if (destinations.size() != targets.size() || frame_bytes == 0) {
+    throw Error("every requested frame needs a destination");
   }
-  ++stats_.requests;
-  stats_.bytes_read += static_cast<int64_t>(bytes.size());
-  stats_.read_calls += calls;
+
+  // 本地文件一次读出整个区间（pread 可能分几次返回）；对象存储的字节由调用方取好
+  const auto length = static_cast<size_t>(range_end - range_start);
+  std::vector<uint8_t> owned;
+  if (data == nullptr) {
+    owned.resize(length);
+    size_t done = 0;
+    while (done < length) {
+      const size_t n = input_->read(range_start + static_cast<int64_t>(done), owned.data() + done, length - done);
+      ++stats_.read_calls;
+      if (n == 0) {
+        throw Error("the file ends at byte " + std::to_string(range_start + static_cast<int64_t>(done)) +
+                    ", before the end of the range " + std::to_string(range_end));
+      }
+      done += n;
+    }
+    data = owned.data();
+  }
+  ++stats_.reads;
+  stats_.bytes_read += static_cast<int64_t>(length);
   stats_.last_range_start = range_start;
   stats_.last_range_end = range_end;
 
@@ -122,7 +136,7 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
     context_retained_ = true;
     context_process_ = getpid();
   }
-  session.set_targets(targets);
+  session.set_targets(targets, destinations, frame_bytes);
   AnnexbFilter filter(codec_config_);
   std::vector<const IndexedPacket*> fed;  // 实际送进解码器的包，按解码顺序
   std::unordered_set<int64_t> pending;    // 送进去、还没显示的帧号
@@ -148,10 +162,10 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
     }
   };
   for (const IndexedPacket& packet : packets) {
-    const uint8_t* data = bytes.data() + (packet.start - range_start);
+    const uint8_t* payload = data + (packet.start - range_start);
     const auto size = static_cast<size_t>(packet.end - packet.start);
     const AccessUnit unit = check_access_unit(
-        data, size, hvcc_, " (frame " + std::to_string(packet.number) + ", bytes " + std::to_string(packet.start) + "-" + std::to_string(packet.end) + ")");
+        payload, size, hvcc_, " (frame " + std::to_string(packet.number) + ", bytes " + std::to_string(packet.start) + "-" + std::to_string(packet.end) + ")");
     // 没有图像参考、也不是要交出的帧，解了也用不上。索引标成 GOP 入口的包照送：解码时核对它是不是 IDR，
     // 跳过就会漏掉索引的这个错误
     if (skip_unreferenced_ && unreferenced(unit, hvcc_) && wanted.count(packet.number) == 0 && !packet.keyframe) {
@@ -160,7 +174,7 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
     }
     const uint8_t* annexb = nullptr;
     size_t annexb_size = 0;
-    filter.filter(data, size, annexb, annexb_size);
+    filter.filter(payload, size, annexb, annexb_size);
     fed.push_back(&packet);
     pending.insert(packet.number);
     session.feed(annexb, annexb_size, packet.number);
@@ -187,7 +201,7 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
     }
     previous = frame.timestamp;
     if (frame.kept) {
-      frames.push_back({frame.timestamp, frame.decode_status, std::move(frame.image)});
+      frames.push_back({frame.timestamp, frame.decode_status});
     }
   }
   if (!pending.empty()) {
@@ -216,8 +230,6 @@ std::vector<IndexedFrame> IndexedDecoder::read_unchecked(int64_t range_start, in
   }
   snapshot_ = session.snapshot();
   has_snapshot_ = true;
-  output_width_ = session.processor().output_width();
-  output_height_ = session.processor().output_height();
   return frames;
 }
 

@@ -25,16 +25,15 @@ struct IndexedPacket {
   bool keyframe = false;
 };
 
-// 一次请求交出的一帧
+// 一次请求交出的一帧；画面已写到调用方给的位置
 struct IndexedFrame {
   int64_t number = 0;
   int decode_status = 0;
-  std::vector<uint8_t> image;
 };
 
 // 累计各次请求；last_range_* 是最近一次请求读的字节范围
 struct IndexedStats {
-  int64_t requests = 0;
+  int64_t reads = 0;  // 读了字节的请求数（对象存储的 HTTP 请求数另由 Python 层记）
   int64_t bytes_read = 0;
   int64_t read_calls = 0;
   int64_t packets = 0;
@@ -49,8 +48,10 @@ struct IndexedStats {
   int64_t last_range_end = -1;
 };
 
-// 按视频索引读帧，不读文件头。每次请求：从文件读一个连续的字节区间，按索引切出解码顺序上连续的一段包，从 GOP 入口
-// 送到最后一个所需的包，发 EOS 排空，交出要的帧。要么交出全部要的帧，要么报错、什么也不交；出错后这个读取器不再可用。
+// 按视频索引读帧，不读文件头。每次请求：取文件里一个连续的字节区间（本地从 input 读，对象存储由调用方取好传进来），
+// 按索引切出解码顺序上连续的一段包，从 GOP 入口
+// 送到最后一个所需的包，发 EOS 排空，要的帧写进调用方按请求分配好的数组。要么交出全部要的帧，要么报错（调用方丢掉写了
+// 一半的数组）；出错后这个读取器不再可用。
 // 每次请求新建 parser 与码流状态，硬件解码器取自进程级缓存（DecoderCache），请求全部核对无误后放回。
 // skip_unreferenced 为真时，没有图像参考、也不是目标的包不送进解码器（hevc.h 的 unreferenced）。
 // 第一次请求时才初始化 CUDA：父进程初始化过 CUDA 后 fork 出的子进程里，新建会话时报错（nvdec.cpp 的进程检查）。
@@ -63,23 +64,22 @@ class IndexedDecoder {
   IndexedDecoder& operator=(const IndexedDecoder&) = delete;
 
   // packets 按解码顺序，正好覆盖 [range_start, range_end)；targets 是要交出的帧号，不重复，都在 packets 里。
-  // 按帧号升序交出
+  // data 为空时从 input 读这段字节（本地文件）；不为空时就是调用方已经取到的这段字节（对象存储），长度是 range_end − range_start。
+  // destinations 与 targets 一一对应，是各帧画面的写入位置，每处 frame_bytes 字节（必须等于输出一帧的大小）。
+  // 按帧号升序交出各帧的帧号与解码状态
   std::vector<IndexedFrame> read(int64_t range_start, int64_t range_end, const std::vector<IndexedPacket>& packets,
-                                 const std::vector<int64_t>& targets);
+                                 const std::vector<int64_t>& targets, const uint8_t* data, const std::vector<uint8_t*>& destinations,
+                                 size_t frame_bytes);
   void close();
 
   const IndexedStats& stats() const { return stats_; }
   bool has_snapshot() const { return has_snapshot_; }
   const DecoderSnapshot& snapshot() const { return snapshot_; }  // 最近一次请求的解码配置
-  int output_width() const { return output_width_; }             // 最近一次请求的输出尺寸
-  int output_height() const { return output_height_; }
-  bool rgb() const { return output_.rgb; }
-  const std::string& colorspace() const { return output_.colorspace; }
-  const std::string& interpolation() const { return output_.interpolation; }
 
  private:
   std::vector<IndexedFrame> read_unchecked(int64_t range_start, int64_t range_end, const std::vector<IndexedPacket>& packets,
-                                           const std::vector<int64_t>& targets);
+                                           const std::vector<int64_t>& targets, const uint8_t* data,
+                                           const std::vector<uint8_t*>& destinations, size_t frame_bytes);
   void release_context();
 
   std::shared_ptr<Input> input_;
@@ -99,8 +99,6 @@ class IndexedDecoder {
   IndexedStats stats_;
   bool has_snapshot_ = false;
   DecoderSnapshot snapshot_;
-  int output_width_ = 0;
-  int output_height_ = 0;
 };
 
 }  // namespace vidlo

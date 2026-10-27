@@ -1,7 +1,7 @@
 """公共读取接口，用法见 docs/api.md。
 
 已实现：本地、R2（s3://）、OSS（oss://）的 MKV 顺序读，输出裁剪、缩放后的 RGB 或原生 NV12，可按步长或帧率选帧；
-按视频索引从本地文件按帧号读（get_frames_at、get_frame_at、get_frames_in_range、下标与切片、read_sample）。
+按视频索引从本地文件、R2、OSS 按帧号读（get_frames_at、get_frame_at、get_frames_in_range、下标与切片、read_sample）。
 架构里其余的参数和函数都保留，用到时报 UnsupportedError。
 """
 
@@ -27,6 +27,11 @@ _REMOTE_SCHEMES = ("s3://", "oss://")
 # 码流的 matrix_coefficients（H.265 表 E.5）→ CV-CUDA 能用的矩阵
 _SOURCE_COLORSPACES = {1: "bt709", 5: "bt601", 6: "bt601", 9: "bt2020"}
 _SELECTION_CHUNK = 4096  # 每次交给 C++ 的选帧决定个数
+# 按帧号读时一次请求的上限：要解码的帧数（解码顺序上从最早的 GOP 入口到最后一个所需的包）与要读的字节数。帧号很分散的
+# 请求不自动拆开，超了在读取前报错。默认值来自实测（H200，1280x720 的 b1 录像）：单进程约 0.8 ms 解一帧、16 个进程共用
+# 一块卡时约 2.1 ms，2,000 帧约 1.6～4.3 s；128 MiB 在 OSS 内网测到的最慢单流（约 9 MB/s）下约 15 s，不超过 30 s 的读取时限
+MAX_DECODE_FRAMES = 2000
+MAX_READ_BYTES = 128 << 20
 # 按帧号读时不读文件头，没有容器的颜色信息：按“容器没写”处理，只看 SPS
 _NO_CONTAINER_COLOR = {"range": 0, "matrix": 2, "chroma_location": 0}
 
@@ -163,7 +168,8 @@ class VideoReader:
     source 为本地路径、s3://桶/路径（R2 等 S3 兼容存储）或 oss://桶/路径。crop 为 (x, y, 宽, 高)，坐标相对于显示区域，
     四个数都必须是偶数（每 2×2 像素共用一份色度）；width、height 为输出尺寸，没给的一边保持裁剪后的尺寸。colorspace 是
     YUV 换成 RGB 用的矩阵，None 按录像标记。format="nv12" 是解码器的原始输出，不裁剪、不缩放、不换颜色。index 为视频
-    索引：给了就只按帧号读，不读文件头。storage_options 是交给存储 SDK 的连接参数，见 _storage.py。
+    索引：给了就只按帧号读，不读文件头。storage_options 是交给存储 SDK 的连接参数，见 _storage.py。max_decode_frames、
+    max_read_bytes 是按帧号读时一次请求要解码的帧数与要读的字节数的上限，默认 MAX_DECODE_FRAMES、MAX_READ_BYTES。
     """
 
     def __init__(
@@ -179,6 +185,8 @@ class VideoReader:
         format: str = "rgb24",
         index: Any = None,
         storage_options: dict[str, Any] | None = None,
+        max_decode_frames: int | None = None,
+        max_read_bytes: int | None = None,
     ) -> None:
         if not isinstance(device, int) or isinstance(device, bool) or device < 0:
             raise ValueError(f"device must be a non-negative integer, got {device!r}")
@@ -198,6 +206,10 @@ class VideoReader:
             raise ValueError(f"format must be one of {_FORMATS}, got {format!r}")
         if format == "nv12" and any(v is not None for v in (crop, width, height, interpolation, colorspace)):
             raise ValueError("format='nv12' is the decoder's raw output; crop, width, height, interpolation and colorspace do not apply")
+        if index is None and (max_decode_frames is not None or max_read_bytes is not None):
+            raise ValueError("max_decode_frames and max_read_bytes only apply when reading by frame number (index=...)")
+        self._max_decode_frames = MAX_DECODE_FRAMES if max_decode_frames is None else _check_positive_int("max_decode_frames", max_decode_frames)
+        self._max_read_bytes = MAX_READ_BYTES if max_read_bytes is None else _check_positive_int("max_read_bytes", max_read_bytes)
         self._device = device
         self._crop = crop
         self._width = width
@@ -210,6 +222,7 @@ class VideoReader:
         self._failed = False  # 按帧号读出过错：之后的请求一律报错，包括空请求
         self._index: _planner.VideoIndex | None = None
         self._download = None
+        self._range: _storage.RangeReader | None = None  # 按帧号读对象存储时取区间
         if index is None:
             self._open_sequential(source, storage_options)
         else:
@@ -258,20 +271,24 @@ class VideoReader:
             weakref.finalize(self, download.cancel)
 
     def _open_indexed(self, source: str | os.PathLike[str], index: Any, storage_options: dict[str, Any] | None) -> None:
-        """按帧号读：只读视频索引，不读文件头；SPS 取自索引的 codec_config。第一次 get_frames_at 时才初始化 CUDA。"""
+        """按帧号读：只读视频索引，不读文件头；SPS 取自索引的 codec_config。第一次 get_frames_at 时才初始化 CUDA。
+        对象存储在打开时不发请求，对象在不在、大小与索引是否相符，第一次读取时核对。"""
         data = _index.load_video_index(index)
+        file_input = None
         if isinstance(source, str) and "://" in source:
             if not source.startswith(_REMOTE_SCHEMES):
                 raise ValueError(f"unknown source scheme in {source!r}; use a local path, s3:// or oss://")
-            raise UnsupportedError("reading by frame number from object storage is not implemented yet")
-        if storage_options is not None:
-            raise ValueError("storage_options only apply to s3:// and oss:// sources")
-        name = os.fspath(source)
-        if not os.path.isfile(name):
-            raise FileNotFoundError(name)
-        file_input = _native.FileInput(name)
-        if file_input.size != data["file_size"]:
-            raise Error(f"{name} has {file_input.size} bytes but the video index says {data['file_size']}: the index is for another file")
+            self._range = _storage.open_range(source, storage_options, data["file_size"])
+        else:
+            if storage_options is not None:
+                raise ValueError("storage_options only apply to s3:// and oss:// sources")
+            name = os.fspath(source)
+            if not os.path.isfile(name):
+                raise FileNotFoundError(name)
+            file_input = _native.FileInput(name)
+            if file_input.size != data["file_size"]:
+                raise Error(f"{name} has {file_input.size} bytes but the video index says {data['file_size']}: "
+                            "the index is for another file")
         codec_config = base64.b64decode(data["codec_config"])
         sps = _hevc.stream_sps(codec_config)
         self._spec = self._output_spec(sps, _NO_CONTAINER_COLOR)
@@ -340,11 +357,13 @@ class VideoReader:
 
     @property
     def stats(self) -> dict[str, Any]:
-        """包数、解码次数、交出与选中的帧数、各解码状态的帧数、读取量；远程录像另有请求数和重试次数。"""
+        """包数、解码次数、交出与选中的帧数、各解码状态的帧数、读取量；远程录像另有 HTTP 请求数（requests，含重试）
+        和重试次数。按帧号读时是各次请求的累计，reads 为读取的次数。"""
         self._check_open()
         stats = self._native.stats()
-        if self._download is not None:
-            stats.update(requests=self._download.requests, retries=self._download.retries)
+        remote = self._download or self._range
+        if remote is not None:
+            stats.update(requests=remote.requests, retries=remote.retries)
         return stats
 
     def __iter__(self) -> Iterator[Frame]:
@@ -427,15 +446,29 @@ class VideoReader:
         if not numbers:
             return self._batch([], np.empty((0, *self._image_shape), dtype=np.uint8), {})
         plan = _planner.plan(self._index, numbers)
+        decode_frames, read_bytes = len(plan.packets), plan.range_end - plan.range_start
+        if decode_frames > self._max_decode_frames or read_bytes > self._max_read_bytes:
+            raise ValueError(f"frames {min(numbers)} to {max(numbers)} in one request need decoding {decode_frames} frames and reading "
+                             f"{read_bytes} bytes; the limits are {self._max_decode_frames} frames (max_decode_frames) and "
+                             f"{self._max_read_bytes} bytes (max_read_bytes). Request frames that are far apart separately, "
+                             "or raise the limits")
+        # 按请求一次分配最终的数组，C++ 把每个不同的帧直接写进它第一次出现的位置，重复的位置在这里复制：各占一份数据
+        images = np.empty((len(numbers), *self._image_shape), dtype=np.uint8)
+        first: dict[int, int] = {}
+        for i, n in enumerate(numbers):
+            first.setdefault(n, i)
+        slots = np.array([first[n] for n in plan.targets], dtype=np.int64)
         try:
-            decoded = self._native.read(plan.range_start, plan.range_end, plan.packets, np.array(plan.targets, dtype=np.int64))
-        except Error:
+            data = None if self._range is None else self._range.fetch(plan.range_start, plan.range_end)
+            decoded = self._native.read(plan.range_start, plan.range_end, plan.packets, np.array(plan.targets, dtype=np.int64),
+                                        images, slots, data)
+        except (Error, FileNotFoundError):
             self._failed = True
             raise
-        images = {number: image for number, image, _ in decoded}
-        statuses = {number: status for number, _, status in decoded}
-        # np.stack 复制到新数组：重复的帧号各占一份，与 C++ 交出的缓冲无关
-        return self._batch(numbers, np.stack([images[n] for n in numbers]), statuses)
+        for i, n in enumerate(numbers):
+            if first[n] != i:
+                images[i] = images[first[n]]
+        return self._batch(numbers, images, dict(decoded))
 
     def _batch(self, numbers: list[int], images: np.ndarray, statuses: dict[int, int]) -> FrameBatch:
         index = self._index
@@ -487,6 +520,8 @@ def read_sample(
     colorspace: str | None = None,
     format: str = "rgb24",
     storage_options: dict[str, Any] | None = None,
+    max_decode_frames: int | None = None,
+    max_read_bytes: int | None = None,
 ) -> FrameBatch:
     """按样本索引读帧（格式见 docs/index-format.md）：在 root 下打开样本的录像，对样本的帧号列表按 step 或 fps 选帧后读取，
     返回值同 VideoReader.get_frames_at。先检查两份索引和样本全部帧号的上界，再选帧，选帧丢掉的越界帧号也报错。
@@ -501,7 +536,7 @@ def read_sample(
     frames = list(sample["frames"]) if sampler is None else sampler.select(sample["frames"])
     with VideoReader(_sample_source(root, sample["video"]), device=device, crop=crop, width=width, height=height,
                      interpolation=interpolation, colorspace=colorspace, format=format, index=index,
-                     storage_options=storage_options) as reader:
+                     storage_options=storage_options, max_decode_frames=max_decode_frames, max_read_bytes=max_read_bytes) as reader:
         return reader.get_frames_at(frames)
 
 
