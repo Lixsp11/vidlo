@@ -1,6 +1,6 @@
 # Index files
 
-vidlo reads two kinds of index files but never creates or stores them; your data pipeline does. Both are JSON. To read with them, see [Reading by frame number](api.md#reading-by-frame-number); this release reads by frame number from local files only.
+vidlo reads two kinds of index files but never creates or stores them; your data pipeline does. Both are JSON. To read with them, see [Reading by frame number](api.md#reading-by-frame-number).
 
 - A **video index** describes one video: where each frame's compressed data is and from where it can be decoded. It lets vidlo fetch a few frames with a single byte-range request instead of reading the whole file.
 - A **sample index** lists the frames of one training sample.
@@ -29,7 +29,7 @@ One file per video, for example `game.index.json`. The arrays below are shortene
 | Field | Meaning |
 | --- | --- |
 | `version` | Format version, currently `1` |
-| `file_size` | Size of the video file in bytes. Checked against the object size on every remote read, so an index that belongs to another file is rejected |
+| `file_size` | Size of the video file in bytes. Checked against the local file when opening it and against the object size on every remote read, so an index for a file of another size is rejected. The index has no fingerprint of the content: a different video of exactly the same size is not detected |
 | `codec` | Codec name; `"hevc"` for now |
 | `codec_config` | The container's codec configuration, base64-encoded (for HEVC in Matroska, the `hvcC` record). Frames in the middle of a video do not carry the parameter sets, so decoding from there needs them |
 | `decode_order` | Position of this frame's packet in decoding order |
