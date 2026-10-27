@@ -1,6 +1,6 @@
 # Reading videos with vidlo
 
-This page covers everything you need to read frames: opening a video, choosing the output, picking frames, the information that comes with each frame, object storage, errors and multiprocessing. Index files are described in [index-format.md](index-format.md).
+This page covers everything you need to read frames: opening a video, choosing the output, picking frames, reading by frame number, the information that comes with each frame, object storage, errors and multiprocessing. Index files are described in [index-format.md](index-format.md).
 
 ## Contents
 
@@ -8,6 +8,7 @@ This page covers everything you need to read frames: opening a video, choosing t
 - [What vidlo can read](#what-vidlo-can-read)
 - [`VideoReader`](#videoreader)
 - [Picking frames](#picking-frames)
+- [Reading by frame number](#reading-by-frame-number)
 - [`Frame`](#frame)
 - [`reader.metadata`](#readermetadata)
 - [Color conversion](#color-conversion)
@@ -35,7 +36,7 @@ Decoding runs on the GPU (NVDEC); cropping, color conversion and resizing run on
 
 ## What vidlo can read
 
-This release reads a video **sequentially, from the first frame to the last**. Reading by frame number is designed but not implemented yet (see [Not implemented yet](#not-implemented-yet)).
+A video is read either **sequentially, from the first frame to the last**, or **by frame number** with a [video index](index-format.md#video-index) (see [Reading by frame number](#reading-by-frame-number)). Reading by frame number works on local files only in this release.
 
 | | Supported now | Otherwise |
 | --- | --- | --- |
@@ -44,7 +45,7 @@ This release reads a video **sequentially, from the first frame to the last**. R
 | GOP structure | every GOP starts with an IDR frame (closed GOPs, B-frames allowed); one frame per packet | `UnsupportedError` |
 | Parameter sets | in the container's codec configuration; copies inside the stream must be identical | `UnsupportedError` |
 | RGB output | full range (0–255), chroma sample location type 0, matrix BT.709, BT.601 or BT.2020 | `UnsupportedError`; `format="nv12"` still works |
-| Sources | local files, S3-compatible storage (`s3://`, e.g. Cloudflare R2), Alibaba Cloud OSS (`oss://`) | `ValueError` for other schemes |
+| Sources | local files, S3-compatible storage (`s3://`, e.g. Cloudflare R2), Alibaba Cloud OSS (`oss://`); reading by frame number: local files | `ValueError` for other schemes; `UnsupportedError` for reading by frame number from object storage |
 
 A recording that was cut off (for example the recorder crashed) is read up to the last complete frame; see [Errors](#errors).
 
@@ -77,7 +78,7 @@ Creating a `VideoReader` opens the video and reads its header; the GPU is used f
 | `interpolation` | `"nearest_exact"`, `"linear"`, `"cubic"` or `"area"`; `None` chooses automatically, see [Cropping and resizing](#cropping-and-resizing) | automatic |
 | `colorspace` | Matrix for YUV → RGB: `"bt601"`, `"bt709"` or `"bt2020"`; `None` uses the matrix tagged in the video, see [Color conversion](#color-conversion) | from the video |
 | `format` | `"rgb24"`: RGB images. `"nv12"`: the decoder's own output, not cropped, resized or converted; `crop`, `width`, `height`, `interpolation` and `colorspace` must then be left out | `"rgb24"` |
-| `index` | Video index for reading by frame number (not implemented yet) | — |
+| `index` | [Video index](index-format.md#video-index) (path or dict) for [reading by frame number](#reading-by-frame-number). The reader then reads only by frame number and never reads the file header | sequential reading |
 | `storage_options` | Connection settings for `s3://` and `oss://`, see [Object storage](#object-storage) | — |
 
 A `VideoReader` is a context manager. `reader.close()` stops downloading and frees the decoder and GPU memory; images you already received stay valid.
@@ -96,6 +97,47 @@ for frame in reader.frames(fps=30, source_fps=60): ...  # frame-rate conversion,
 
 Frames that are not kept are still decoded (later frames may depend on them) and checked, but they are not converted or copied. A `VideoReader` can be read sequentially only once; open a new one to read the video again.
 
+## Reading by frame number
+
+With a [video index](index-format.md#video-index), a reader fetches only the frames you ask for:
+
+```python
+index = vidlo.load_video_index("game.index.json")
+with vidlo.VideoReader("game.mkv", index=index, crop=(16, 0, 1248, 720), width=832, height=480) as reader:
+    len(reader)                                     # frames in the index
+    batch = reader.get_frames_at([3000, 3002, 3000])
+    batch.images                                    # numpy uint8, shape (3, 480, 832, 3)
+    frame = reader[3000]                            # one Frame, same as reader.get_frame_at(3000)
+    clip = reader.get_frames_in_range(3000, 3161, 2)  # 81 frames, every second one
+```
+
+| Call | Returns |
+| --- | --- |
+| `get_frames_at(frames)` | A [`FrameBatch`](#framebatch) in the order of `frames`; any order and repeats are allowed, negative numbers count from the end (`-1` is the last frame) |
+| `get_frame_at(i)`, `reader[i]` | One [`Frame`](#frame) |
+| `get_frames_in_range(start, stop, step=1)` | A `FrameBatch` for `range(start, stop, step)`; bounds outside the video are clipped as for a slice; `step` must be positive |
+| `reader[a:b:k]` | A `FrameBatch`; the slice may go backwards |
+| `len(reader)` | The number of frames in the index |
+
+- A frame number outside the video raises `IndexError`, anything that is not an integer raises `ValueError`, both before anything is read. An empty list returns an empty batch.
+- One request reads one contiguous byte range, from the key frame that starts the GOP of the earliest requested frame to the last packet needed in decoding order, and decodes that range. Frames needed only as references are decoded but not converted or copied; frames that no other frame refers to are not decoded at all unless requested. Frames far apart (for example frames 0 and 3000) make one request read and decode everything in between; ask for them separately.
+- A request returns all its frames or raises; after an error the reader reads nothing more.
+- The file header is never read. `metadata.container`, `time_base`, `container_range`, `container_matrix`, `container_chroma_location` and every `pts` are `None` (the index stores no timestamps); size and color tags come from the index's `codec_config`. The file size must equal the index's `file_size`.
+- A reader opened with an index cannot be iterated; one opened without an index has no `len()` and no reading by frame number.
+- Hardware decoders are kept for the next request, also across readers and files as long as the video format (codec, coded size, bit depth) is the same: creating and destroying one costs tens to a few hundred milliseconds. Each process keeps one idle decoder per GPU; `vidlo.set_decoder_cache_capacity(n)` changes that, and `0` turns the cache off and frees the idle decoders (each holds some GPU memory).
+
+### `FrameBatch`
+
+`images` is one `numpy.uint8` array: `(frames, height, width, 3)` for RGB, `(frames, height * 3 / 2, width)` for NV12. Repeated frame numbers get separate copies. The other attributes have the names of the [`Frame`](#frame) attributes and are lists with one entry per requested position.
+
+### `vidlo.read_sample`
+
+```python
+batch = vidlo.read_sample("fight-03-a.json", "game.index.json", "/data", step=2, width=832, height=480)
+```
+
+`vidlo.read_sample(sample_index, video_index, root, *, step=None, fps=None, source_fps=None, ...)` reads one [sample index](index-format.md#sample-index): it opens `root` + the sample's `video` with the video index, picks frames from the sample's list with `step` or `fps`/`source_fps` (by position in the list, as in [Picking frames](#picking-frames)) and returns the `FrameBatch`. The other keyword arguments are those of `VideoReader` except `source` and `index`. Both indexes and every frame number of the sample are checked first, including frames that `step` would drop. `root` is a local directory, or an `s3://` or `oss://` prefix (not implemented yet for reading by frame number).
+
 ## `Frame`
 
 Each frame is a `vidlo.Frame` with these attributes:
@@ -104,7 +146,7 @@ Each frame is a `vidlo.Frame` with these attributes:
 | --- | --- |
 | `image` | `numpy.uint8` array. `rgb24`: shape `(height, width, 3)`. `nv12`: shape `(height * 3 / 2, width)`, the luma rows followed by the interleaved chroma rows |
 | `number` | Frame number in display order, starting at 0; frames that were not kept are counted too |
-| `pts` | Presentation timestamp from the file, an integer in units of `reader.metadata.time_base` |
+| `pts` | Presentation timestamp from the file, an integer in units of `reader.metadata.time_base`; `None` when reading by frame number |
 | `key_frame` | Whether the frame is a key frame (IDR) |
 | `decode_status` | Decoder status of this frame; frames you receive always decoded successfully |
 | `decode_order` | Position of this frame's packet in decoding order |
@@ -117,7 +159,7 @@ Each frame is a `vidlo.Frame` with these attributes:
 
 ## `reader.metadata`
 
-`reader.metadata` is a `vidlo.VideoMetadata` with information from the file header. It is available as soon as the reader is created, and still after it is closed.
+`reader.metadata` is a `vidlo.VideoMetadata` with information from the file header. It is available as soon as the reader is created, and still after it is closed. When reading by frame number the header is not read: the attributes that come from the container (`container`, `time_base`, `container_range`, `container_matrix`, `container_chroma_location`, `etag`) are `None`, the rest comes from the video index.
 
 | Attribute | Meaning |
 | --- | --- |
@@ -181,7 +223,8 @@ reader = vidlo.VideoReader(
 | `vidlo.Error` (a `RuntimeError`) | Reading or decoding failed, the data is inconsistent, or the reader is used after `close()` |
 | `vidlo.UnsupportedError` (a `vidlo.Error`) | The video or the settings need something that is planned but not implemented yet |
 | `vidlo.TruncatedError` (a `vidlo.Error`) | The file is cut off. It is raised only after every complete frame has been delivered |
-| `ValueError` | Invalid arguments or combinations of arguments, including `storage_options` |
+| `ValueError` | Invalid arguments or combinations of arguments, including `storage_options`; reading by frame number without a video index |
+| `IndexError` | A frame number outside the video |
 | `FileNotFoundError` | The local file or the remote object does not exist |
 
 After an error (other than `TruncatedError` at the end) the reader delivers no more frames.
@@ -192,17 +235,16 @@ After an error (other than `TruncatedError` at the end) the reader delivers no m
 - `import vidlo` does not initialize CUDA, so worker processes started after the import can use vidlo.
 - CUDA does not work in a process forked after its parent used CUDA. In such a child, opening a video or using a reader inherited from the parent raises `vidlo.Error` that tells you to use the `spawn` or `forkserver` start method, for example `DataLoader(..., multiprocessing_context="spawn")`. If the parent used CUDA through another library, vidlo cannot tell beforehand; CUDA initialization then fails in the child with the same advice.
 - Pass images between processes as CPU arrays; GPU memory is never shared.
+- Each process has its own cache of idle hardware decoders (see [Reading by frame number](#reading-by-frame-number)); a forked child starts with an empty one.
 
 ## Diagnostics
 
-- `reader.stats`: packets, decoder calls, frames shown and kept, decode status counts, bytes read, seeks, where a truncated file ends, and for remote sources the number of requests and retries.
-- `reader.decoder_config`: driver version, GPU name and UUID, and the parameters passed to NVDEC together with what it reported (available after the first frame).
+- `reader.stats`: packets, decoder calls, frames shown and kept, decode status counts, bytes read, seeks, where a truncated file ends, and for remote sources the number of requests and retries. When reading by frame number, totals over all requests instead: requests, bytes read and read calls, packets sent to the decoder and packets `skipped` (no frame refers to them and they were not requested), decoder calls, frames shown and kept, how often the hardware decoder was reused or created, and the byte range of the last request (`last_range`).
+- `reader.decoder_config`: driver version, GPU name and UUID, and the parameters passed to NVDEC together with what it reported (available after the first frame; when reading by frame number, those of the last request).
 
 ## Not implemented yet
 
 These are part of the interface and raise `vidlo.UnsupportedError` for now:
 
-- `VideoReader(..., index=...)` and `reader.get_frames_at(frame_numbers)`: read given frames using a video index, in the given order, repeats allowed.
-- `reader.submit(frame_numbers)`: the same, asynchronously.
-- `vidlo.read_sample(sample_index, video_index, root, ...)`: read the frames listed in a sample index.
-- `len(reader)` and `reader[i]` will follow together with reading by frame number.
+- Reading by frame number (`index=...`, `read_sample`) from `s3://` and `oss://` sources.
+- `reader.submit(frame_numbers)`: `get_frames_at` asynchronously.

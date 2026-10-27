@@ -26,6 +26,7 @@
 - **Object storage**: one streaming read from S3-compatible storage (Cloudflare R2) or Alibaba Cloud OSS, resumed after network errors while making sure the object did not change.
 - **Frame selection**: every k-th frame, or frame-rate conversion compatible with VPF's `EMDownSampler`; frames that are not kept are never converted or copied.
 - **Index-ready**: each frame reports the byte range of its packet and where decoding must start, so a pipeline can write [video indexes](docs/index-format.md) in one pass.
+- **Reading by frame number**: with a video index, one byte-range read per request, decoding starts at the right key frame and skips frames nothing refers to; hardware decoders are reused across requests and files.
 
 ## Install
 
@@ -47,6 +48,10 @@ with vidlo.VideoReader("game.mkv", crop=(32, 0, 1248, 720), width=832, height=48
     for frame in reader.frames(step=2):
         frame.image   # numpy uint8, (480, 832, 3), RGB
         frame.pts     # timestamp in units of reader.metadata.time_base
+
+with vidlo.VideoReader("game.mkv", index="game.index.json", width=832, height=480) as reader:
+    batch = reader.get_frames_at([3000, 3002, 3004])
+    batch.images      # numpy uint8, (3, 480, 832, 3)
 ```
 
 See [docs/api.md](docs/api.md) for every option and [docs/index-format.md](docs/index-format.md) for index files.

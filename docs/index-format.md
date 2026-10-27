@@ -1,6 +1,6 @@
 # Index files
 
-vidlo reads two kinds of index files but never creates or stores them; your data pipeline does. Both are JSON. Reading by index is not implemented yet in this release, but the formats and the functions that load and check them are.
+vidlo reads two kinds of index files but never creates or stores them; your data pipeline does. Both are JSON. To read with them, see [Reading by frame number](api.md#reading-by-frame-number); this release reads by frame number from local files only.
 
 - A **video index** describes one video: where each frame's compressed data is and from where it can be decoded. It lets vidlo fetch a few frames with a single byte-range request instead of reading the whole file.
 - A **sample index** lists the frames of one training sample.
@@ -45,7 +45,7 @@ To read frames `f1, f2, …`, vidlo decodes packets `min(decode_start)` to `max(
 - exactly these fields are present and `version` is known;
 - all arrays have the same, non-zero length;
 - `decode_order` contains each of `0 … frames-1` exactly once;
-- each frame's `decode_start` is at most its `decode_order`;
+- each frame's `decode_start` is at most its `decode_order`, and points at a packet that starts a GOP (the frame of that packet has it as its own `decode_start`);
 - in decoding order, packet byte ranges are non-empty, increasing, do not overlap and end within `file_size`;
 - `codec_config` is valid, non-empty base64.
 
@@ -97,9 +97,9 @@ One file per sample, for example `fight-03-a.json`:
 
 | Field | Meaning |
 | --- | --- |
-| `video` | The sample's video, as a path relative to a data root that you pass when reading (POSIX separators, no `..`, not absolute) |
+| `video` | The sample's video, as a path relative to a data root that you pass when reading (POSIX separators; not absolute; no empty, `.` or `..` parts) |
 | `frames` | Frame numbers in display order (starting at 0); any order, repeats and gaps are allowed |
 
 `vidlo.load_sample_index(path_or_dict)` and `vidlo.validate_sample_index(dict)` check the fields and raise `vidlo.Error` for a bad path or an empty or negative frame list. Whether the frame numbers exist in the video is checked when reading.
 
-To read a sample at a lower frame rate, select from its frame list with `step` (every k-th entry) or `fps` and `source_fps`; see [Picking frames](api.md#picking-frames).
+`vidlo.read_sample` reads a sample (see [`vidlo.read_sample`](api.md#vidloread_sample)). To read it at a lower frame rate, select from its frame list with `step` (every k-th entry) or `fps` and `source_fps`; see [Picking frames](api.md#picking-frames).
