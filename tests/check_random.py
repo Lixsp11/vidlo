@@ -7,11 +7,14 @@ SHA256、逐帧信息、读取的字节区间、送进解码器与跳过的包�
 倒序、重复、负下标、16 帧连续与 81 帧隔一帧的随机片段。
 
 配置：默认（解码器缓存容量 1、跳过没人参考的非目标帧）每段录像跑全部请求；给了两段以上录像时，几个读取器交替请求，
-解码器跨文件复用；缓存与跳帧的另外三种组合（缓存关闭且不跳帧就是第 1 步的做法）各跑一部分请求。full range 的录像另比
-RGB：同样的裁剪缩放（左右各裁 16 列，缩到 2/3）顺序读一遍作参照，按帧号读一部分请求逐帧比较。多时间层的录像（如 x265
+解码器跨文件复用（编码尺寸相同、显示区域不同的录像也复用，full range 时另用整帧 RGB 交替一遍）；缓存与跳帧的另外三种
+组合（缓存关闭且不跳帧就是第 1 步的做法）各跑一部分请求。full range 的录像另比
+RGB 的 12 种设置（训练用的裁剪缩小、整帧、只裁剪、各种插值的缩小与放大、奇数尺寸、宽放大高缩小、换矩阵，见 rgb_settings）：
+每种同样的设置顺序读一遍作参照，按帧号读一部分请求逐帧比较；另查重复的帧号各占一份数据、读取器关闭后交出的图像不变。多时间层的录像（如 x265
 temporal-layers=3）里，低层的 sub-layer non-reference 帧会被高层参考，不能跳过，报告里分层列出数量。另测应当报错的情况：
 越界、类型不对、读取器模式不对、索引的文件大小不符、decode_start 指向的不是 GOP 入口（检查时发现）或不是 IDR（解码时
-发现，含把可跳过的帧冒充成入口）、出错后的请求、fork（子进程报错，且拿到的是新的空缓存）。
+发现，含把可跳过的帧冒充成入口）、出错后的请求、一次请求超过要解码的帧数或要读的字节数上限（读取前报错，读取器照常
+可用）、fork（子进程报错，且拿到的是新的空缓存）。
 
 输出目录必须不存在，结果写进 report.json。
 """
@@ -35,6 +38,8 @@ import vidlo
 
 FIELDS = ("decode_order", "decode_start", "packet_start", "packet_end")
 SUCCESS = 2  # cuvidDecodeStatus_Success
+# 正确性检查里有跨整段录像的请求（如最后一帧再第一帧），超过库的默认上限；这些读取器把上限放开，上限本身在 limit_checks 里测
+NO_LIMITS = {"max_decode_frames": 1 << 40, "max_read_bytes": 1 << 60}
 
 
 def sha(array: np.ndarray) -> str:
@@ -146,6 +151,18 @@ def expected_plan(index: dict, numbers: list[int], unreferenced: list[bool], ski
     return s, e, index["packet_start"][frame_at[s]], index["packet_end"][frame_at[e]], skipped
 
 
+def repeats_independent(images: np.ndarray, numbers: list[int]) -> bool:
+    """最后一个帧号在前面出现过时，改最后那份数据，前面那份不变（重复的帧号各占一份数据）。"""
+    first = numbers.index(numbers[-1]) if numbers else 0
+    if first >= len(numbers) - 1:
+        return True
+    keep = images[first].copy()
+    images[-1][0, 0] ^= 0xFF
+    independent = np.array_equal(images[first], keep)
+    images[-1][0, 0] ^= 0xFF
+    return independent
+
+
 def check_request(reader: vidlo.VideoReader, ref: dict, label: str, frames: list[int], skip: bool = True) -> dict:
     index, hashes = ref["index"], ref["hashes"]
     count = len(hashes)
@@ -174,9 +191,9 @@ def check_request(reader: vidlo.VideoReader, ref: dict, label: str, frames: list
     if batch.colorspace != [None] * len(numbers) or batch.interpolation != [None] * len(numbers):
         problems.append("colorspace or interpolation should be None for nv12")
     fed = e - s + 1 - skipped
-    keys = ("requests", "bytes_read", "packets", "skipped", "decode_calls", "displayed", "kept")
+    keys = ("reads", "bytes_read", "packets", "skipped", "decode_calls", "displayed", "kept")
     delta = {k: after[k] - before[k] for k in keys}
-    want = {"requests": 1, "bytes_read": b - a, "packets": fed, "skipped": skipped, "decode_calls": fed, "displayed": fed,
+    want = {"reads": 1, "bytes_read": b - a, "packets": fed, "skipped": skipped, "decode_calls": fed, "displayed": fed,
             "kept": len(set(numbers))}
     if delta != want:
         problems.append(f"stats delta {delta}, expected {want}")
@@ -185,15 +202,8 @@ def check_request(reader: vidlo.VideoReader, ref: dict, label: str, frames: list
         problems.append("decoder neither created nor reused once")
     if tuple(after["last_range"]) != (a, b):
         problems.append(f"read range {after['last_range']}, expected {(a, b)}")
-    # 重复的帧号各占一份数据：改一份，另一份不变
-    if len(set(numbers)) < len(numbers):
-        first = numbers.index(numbers[-1])
-        if first != len(numbers) - 1:
-            keep = batch.images[first].copy()
-            batch.images[-1][0, 0] ^= 0xFF
-            if not np.array_equal(batch.images[first], keep):
-                problems.append("repeated frames share memory")
-            batch.images[-1][0, 0] ^= 0xFF
+    if not repeats_independent(batch.images, numbers):
+        problems.append("repeated frames share memory")
     return {"request": label, "frames": len(frames), "packets": e - s + 1, "fed": fed, "skipped": skipped, "reused_decoder": bool(reused),
             "range": [a, b], "bytes": b - a, "elapsed_s": round(elapsed, 4), "passed": not problems, "problems": problems}
 
@@ -227,9 +237,9 @@ def error_checks(ref: dict, device: int) -> list[dict]:
         results.append({"check": "no I/O after bad requests", "passed": reader.stats == stats})
     with vidlo.VideoReader(video, device=device, format="nv12") as reader:
         results.append(expect_error("get_frames_at without index", ValueError, lambda: reader.get_frames_at([0])))
-    results.append(expect_error("object storage", vidlo.UnsupportedError,
-                                lambda: vidlo.VideoReader("oss://bucket/key.mkv", format="nv12", index=index,
-                                                          storage_options={"region": "us-southeast-1"})))
+    results += limit_checks(ref, device)
+    # 对象存储的按帧号读在 check_storage.py（假客户端）与 check_remote.py（真实 R2、OSS）里测
+    results.append(expect_error("unknown scheme", ValueError, lambda: vidlo.VideoReader("http://host/key.mkv", format="nv12", index=index)))
     wrong_size = dict(index, file_size=index["file_size"] + 1)
     results.append(expect_error("index for another file size", vidlo.Error, lambda: vidlo.VideoReader(video, format="nv12", index=wrong_size)))
 
@@ -266,6 +276,43 @@ def error_checks(ref: dict, device: int) -> list[dict]:
     return results
 
 
+def limit_checks(ref: dict, device: int) -> list[dict]:
+    """一次请求的上限：要解码的帧数（从最早的 GOP 入口到最后一个所需的包）或要读的字节数超了，在读取前报 ValueError，
+    不读不解，同一个读取器之后照常可用；正好等于上限时能读。上限只用于按帧号读。"""
+    video, index, hashes = ref["video"], ref["index"], ref["hashes"]
+    count = len(hashes)
+    keys = [f for f in range(count) if index["decode_start"][f] == index["decode_order"][f]]
+    far = [keys[0], keys[3]]  # 跨 3 个以上 GOP；关键帧在显示和解码顺序里都排在 GOP 第一个
+    span = keys[3] - keys[0] + 1
+    size = index["packet_end"][keys[3]] - index["packet_start"][keys[0]]
+    results = []
+
+    def check(name: str, limits: dict) -> None:
+        with vidlo.VideoReader(video, device=device, format="nv12", index=index, **limits) as reader:
+            stats = reader.stats
+            over = expect_error(f"{name}: over the limit", ValueError, lambda: reader.get_frames_at(far))
+            unchanged = reader.stats == stats
+            batch = reader.get_frames_at([keys[0]])
+            over["nothing read, reader still usable"] = unchanged and sha(batch.images[0]) == hashes[keys[0]]
+            over["passed"] = over["passed"] and over["nothing read, reader still usable"]
+            results.append(over)
+        at = {k: v + 1 for k, v in limits.items()}
+        with vidlo.VideoReader(video, device=device, format="nv12", index=index, **at) as reader:
+            batch = reader.get_frames_at(far)
+            results.append({"check": f"{name}: exactly at the limit", "passed": [sha(i) for i in batch.images] == [hashes[f] for f in far]})
+
+    check("max_decode_frames", {"max_decode_frames": span - 1})
+    check("max_read_bytes", {"max_read_bytes": size - 1})
+    if count > vidlo._reader.MAX_DECODE_FRAMES:
+        with vidlo.VideoReader(video, device=device, format="nv12", index=index) as reader:
+            results.append(expect_error("whole video over the default limit", ValueError, lambda: reader.get_frames_at([0, count - 1])))
+    results.append(expect_error("max_decode_frames without index", ValueError,
+                                lambda: vidlo.VideoReader(video, device=device, format="nv12", max_decode_frames=10)))
+    results.append(expect_error("max_read_bytes 0", ValueError,
+                                lambda: vidlo.VideoReader(video, device=device, format="nv12", index=index, max_read_bytes=0)))
+    return results
+
+
 def fork_check(video: Path, device: int, index: dict) -> dict:
     """本进程已经初始化过 CUDA：fork 出的子进程读帧应报错并提示改用 spawn；子进程里的解码器缓存是新的空缓存。"""
     with vidlo.VideoReader(video, device=device, format="nv12", index=index) as reader:
@@ -290,7 +337,7 @@ def fork_check(video: Path, device: int, index: dict) -> dict:
 def run_default(ref: dict, device: int, seed: int, clips: int) -> tuple[list[dict], dict, dict, dict]:
     """默认配置：全部请求。缓存里已有同格式的空闲解码器时第一个请求就复用，之后每个请求都复用。"""
     results = []
-    with vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"]) as reader:
+    with vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"], **NO_LIMITS) as reader:
         for label, frames in requests(ref["index"], seed, clips):
             results.append(check_request(reader, ref, label, frames))
         stats, decoder_config, metadata = reader.stats, reader.decoder_config, reader.metadata
@@ -303,22 +350,61 @@ def run_default(ref: dict, device: int, seed: int, clips: int) -> tuple[list[dic
 
 
 def run_alternating(refs: list[dict], device: int, seed: int, rounds: int) -> tuple[list[dict], dict]:
-    """几个读取器（不同文件）交替请求：格式相同，缓存里的一个解码器跨文件复用，不新建。"""
+    """几个读取器（不同文件）交替请求：建解码器的参数相同，缓存里的一个解码器跨文件复用，不新建。编码尺寸相同、显示区域
+    不同的录像（码流的裁剪窗口不同）也复用同一个解码器，显示区域按各自的码流取；都是 full range 时另用整帧 RGB 交替一遍。"""
     rng = random.Random(seed + 1)
+    plan = [(i % len(refs), rng.randrange(0, len(refs[i % len(refs)]["hashes"]) - 16)) for i in range(rounds * len(refs))]
     readers = [vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"]) for ref in refs]
     results = []
     try:
-        for i in range(rounds * len(refs)):
-            ref, reader = refs[i % len(refs)], readers[i % len(refs)]
-            s = rng.randrange(0, len(ref["hashes"]) - 16)
-            results.append(check_request(reader, ref, f"{ref['video'].name} 16 from {s}", list(range(s, s + 16))))
+        for k, s in plan:
+            results.append(check_request(readers[k], refs[k], f"{refs[k]['video'].name} 16 from {s}", list(range(s, s + 16))))
         creations = sum(r.stats["decoder_creations"] for r in readers)
+        configs = [r.decoder_config.get("create") for r in readers]
     finally:
         for reader in readers:
             reader.close()
     phase = {"phase": "alternating videos", "requests": len(results), "decoder_creations": creations,
+             "same_decoder_parameters": bool(configs[0]) and all(c == configs[0] for c in configs),
              "passed": all(r["passed"] for r in results) and creations == 0}
+    phase["passed"] = phase["passed"] and phase["same_decoder_parameters"]
+    if all(ref["full_range"] for ref in refs):
+        found, rgb_creations = alternating_rgb(refs, device, plan)
+        results += found
+        phase["rgb_decoder_creations"] = rgb_creations
+        phase["passed"] = phase["passed"] and all(r["passed"] for r in found) and rgb_creations == 0
     return results, phase
+
+
+def alternating_rgb(refs: list[dict], device: int, plan: list[tuple[int, int]]) -> tuple[list[dict], int]:
+    """整帧 RGB（只换颜色，尺寸为各自的显示区域）交替读，与各自顺序读的整帧 RGB 逐帧比较。"""
+    needed = [set() for _ in refs]
+    for k, s in plan:
+        needed[k].update(range(s, s + 16))
+    reference = []
+    for ref, frames in zip(refs, needed):
+        with vidlo.VideoReader(ref["video"], device=device) as reader:
+            reference.append({frame.number: sha(frame.image) for frame in reader if frame.number in frames})
+    readers = [vidlo.VideoReader(ref["video"], device=device, index=ref["index"]) for ref in refs]
+    results = []
+    try:
+        for k, s in plan:
+            frames = list(range(s, s + 16))
+            batch = readers[k].get_frames_at(frames)
+            meta = readers[k].metadata
+            problems = []
+            if batch.images.shape != (16, meta.height, meta.width, 3):
+                problems.append(f"images shape {batch.images.shape}")
+            wrong = [n for j, n in enumerate(frames) if sha(batch.images[j]) != reference[k][n]]
+            if wrong:
+                problems.append(f"{len(wrong)} frames differ from the sequential RGB read, first {wrong[:5]}")
+            results.append({"request": f"RGB whole picture {refs[k]['video'].name} 16 from {s}", "frames": 16, "passed": not problems,
+                            "problems": problems})
+        creations = sum(r.stats["decoder_creations"] for r in readers)
+    finally:
+        for reader in readers:
+            reader.close()
+    return results, creations
 
 
 def run_config(ref: dict, device: int, seed: int, clips: int, count: int, capacity: int, skip: bool) -> tuple[list[dict], dict]:
@@ -326,7 +412,7 @@ def run_config(ref: dict, device: int, seed: int, clips: int, count: int, capaci
     vidlo._native.set_decoder_cache_capacity(capacity)
     results = []
     try:
-        with vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"]) as reader:
+        with vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"], **NO_LIMITS) as reader:
             if not skip:  # 测试专用：换成不跳帧的原生读取器
                 reader._native = vidlo._native.IndexedDecoder(vidlo._native.FileInput(str(ref["video"])), reader.metadata.codec_config,
                                                               device, reader._spec, skip_unreferenced=False)
@@ -403,9 +489,8 @@ def run_api(ref: dict, device: int, output: Path) -> tuple[list[dict], dict]:
     for bad in ("../x.mkv", "a//b.mkv", "./b.mkv", "/abs.mkv", "s3://b/k.mkv"):
         results.append(expect_error(f"read_sample video path {bad!r}", vidlo.Error,
                                     lambda b=bad: vidlo.read_sample(dict(sample, video=b), index, root, format="nv12")))
-    results.append(expect_error("read_sample from object storage", vidlo.UnsupportedError,
-                                lambda: vidlo.read_sample(sample, index, "oss://bucket/prefix", format="nv12",
-                                                          storage_options={"region": "us-southeast-1"})))
+    results.append(expect_error("read_sample unknown root scheme", ValueError,
+                                lambda: vidlo.read_sample(sample, index, "http://host/prefix", format="nv12")))
     results.append(expect_error("cache capacity -1", ValueError, lambda: vidlo.set_decoder_cache_capacity(-1)))
     results.append(expect_error("cache capacity True", ValueError, lambda: vidlo.set_decoder_cache_capacity(True)))
     vidlo.set_decoder_cache_capacity(1)
@@ -413,35 +498,87 @@ def run_api(ref: dict, device: int, output: Path) -> tuple[list[dict], dict]:
     return results, phase
 
 
-def run_rgb(ref: dict, device: int, seed: int, clips: int, count: int) -> tuple[list[dict], dict] | None:
-    """RGB 输出：同样的裁剪缩放先顺序读一遍作参照，再按帧号读一部分请求逐帧比较。limited range 的录像不能转 RGB，跳过。"""
+def rgb_settings(width: int, height: int, matrix: str | None) -> list[tuple[str, dict]]:
+    """RGB 的各种设置，按显示区域的尺寸给出。第一种是训练用的（左右各裁 16 列、缩到 2/3）。裁剪的四个数是偶数，输出尺寸
+    可以是奇数；面积插值不能放大，放大的设置指定别的插值或用默认（只放大时默认三次插值）。"""
+    def even(v: float) -> int:
+        return int(v) // 2 * 2
+
+    train = {"crop": (16, 0, width - 32, height), "width": even((width - 32) * 2 / 3), "height": even(height * 2 / 3)}
+    middle = (even(width / 4), even(height / 4), even(width / 2), even(height / 2))
+    other = "bt601" if matrix != "bt601" else "bt709"
+    return [
+        ("training crop and shrink", train),
+        ("whole picture", {}),
+        ("crop only", {"crop": (even(width / 10), even(height / 6), even(width * 3 / 5), even(height / 2))}),
+        ("shrink to an odd size, area by default", {"width": width * 2 // 3 | 1, "height": height * 2 // 3 | 1}),
+        ("shrink, linear", {"width": width // 2, "height": height // 2, "interpolation": "linear"}),
+        ("shrink, cubic", {"width": width * 3 // 4, "height": height * 3 // 4, "interpolation": "cubic"}),
+        ("shrink, nearest_exact", {"width": width * 3 // 5, "height": height * 3 // 5, "interpolation": "nearest_exact"}),
+        ("crop and enlarge 2x, cubic by default", {"crop": middle, "width": middle[2] * 2, "height": middle[3] * 2}),
+        ("crop and enlarge 2x, nearest_exact", {"crop": middle, "width": middle[2] * 2, "height": middle[3] * 2, "interpolation": "nearest_exact"}),
+        ("crop and enlarge 1.37x, linear", {"crop": middle, "width": int(middle[2] * 1.37), "height": int(middle[3] * 1.37),
+                                            "interpolation": "linear"}),
+        ("wider and shorter, linear", {"width": width * 5 // 4, "height": height // 2, "interpolation": "linear"}),
+        (f"matrix {other} instead of the video's", dict(train, colorspace=other)),
+    ]
+
+
+def run_rgb(ref: dict, device: int, seed: int, clips: int, kept: list[dict]) -> tuple[list[dict], list[dict]] | None:
+    """RGB 输出的各种设置：每种先顺序读一遍作参照，再按帧号读一部分请求逐帧比较像素、形状、实际矩阵与插值；顺序读的
+    颜色、裁剪、缩放已与 swscale、OpenCV 比较过（compare_ffmpeg_rgb.py、check_synthetic.py）。重复的帧号各占一份数据；
+    读取器关闭后，交出的图像还是原来的内容（每种设置留下两个请求的结果放进 kept，最后再核对一次）。
+    limited range 的录像不能转 RGB，跳过。"""
     with vidlo.VideoReader(ref["video"], device=device, format="nv12", index=ref["index"]) as probe:
         metadata = probe.metadata  # 按帧号读的读取器打开时不解码
     if not metadata.full_range:
         return None
-    width, height = metadata.width - 32, metadata.height
-    options = {"crop": (16, 0, width, height), "width": width * 2 // 3 // 2 * 2, "height": height * 2 // 3 // 2 * 2}
-    reference = []
-    with vidlo.VideoReader(ref["video"], device=device, **options) as reader:
-        for frame in reader:
-            reference.append((sha(frame.image), frame.colorspace, frame.interpolation))
-    results = []
-    with vidlo.VideoReader(ref["video"], device=device, index=ref["index"], **options) as reader:
-        for label, frames in requests(ref["index"], seed, clips)[:count]:
-            numbers = [f % len(reference) for f in frames]
-            batch = reader.get_frames_at(frames)
-            problems = []
-            if batch.images.shape != (len(frames), options["height"], options["width"], 3):
-                problems.append(f"images shape {batch.images.shape}")
-            wrong = [n for i, n in enumerate(numbers) if i < len(batch.images) and sha(batch.images[i]) != reference[n][0]]
-            if wrong:
-                problems.append(f"{len(wrong)} frames differ from the sequential RGB read, first {wrong[:5]}")
-            if list(zip(batch.colorspace, batch.interpolation)) != [reference[n][1:] for n in numbers]:
-                problems.append("colorspace or interpolation differ from the sequential read")
-            results.append({"request": f"RGB {label}", "frames": len(frames), "passed": not problems, "problems": problems})
-    phase = {"phase": f"RGB {options['crop']} -> {options['width']}x{options['height']}, {ref['video'].name}", "requests": len(results),
-             "passed": all(r["passed"] for r in results)}
-    return results, phase
+    count = len(ref["hashes"])
+    every = requests(ref["index"], seed, clips)
+    few = (every[:5] + [r for r in every if r[0] in ("reverse", "repeats")]
+           + [next(r for r in every if r[0].startswith(prefix)) for prefix in ("16 from", "81 every 2nd")])
+    matrix = vidlo._reader._SOURCE_COLORSPACES.get(metadata.matrix_coefficients)
+    results, phases = [], []
+    for i, (name, options) in enumerate(rgb_settings(metadata.width, metadata.height, matrix)):
+        chosen = every[:30] if i == 0 else few
+        needed = {f % count for _, frames in chosen for f in frames}
+        reference = {}
+        with vidlo.VideoReader(ref["video"], device=device, **options) as reader:
+            for frame in reader:
+                shape = frame.image.shape
+                if frame.number in needed:
+                    reference[frame.number] = (sha(frame.image), frame.colorspace, frame.interpolation)
+        found, keep = [], []
+        with vidlo.VideoReader(ref["video"], device=device, index=ref["index"], **options, **NO_LIMITS) as reader:
+            for label, frames in chosen:
+                numbers = [f % count for f in frames]
+                batch = reader.get_frames_at(frames)
+                problems = []
+                if batch.images.shape != (len(frames), *shape) or batch.images.dtype != np.uint8:
+                    problems.append(f"images shape {batch.images.shape} {batch.images.dtype}, expected {(len(frames), *shape)}")
+                wrong = [n for j, n in enumerate(numbers) if j < len(batch.images) and sha(batch.images[j]) != reference[n][0]]
+                if wrong:
+                    problems.append(f"{len(wrong)} frames differ from the sequential RGB read, first {wrong[:5]}")
+                if list(zip(batch.colorspace, batch.interpolation)) != [reference[n][1:] for n in numbers]:
+                    problems.append("colorspace or interpolation differ from the sequential read")
+                if not repeats_independent(batch.images, numbers):
+                    problems.append("repeated frames share memory")
+                if label in ("first", "repeats"):
+                    keep.append({"setting": name, "request": label, "images": batch.images,
+                                 "hashes": [reference[n][0] for n in numbers]})
+                found.append({"request": f"RGB {name}: {label}", "frames": len(frames), "passed": not problems, "problems": problems})
+        found.append({"request": f"RGB {name}: images unchanged after the reader closed", "frames": sum(len(k["hashes"]) for k in keep),
+                      "passed": unchanged(keep)})
+        kept += keep
+        results += found
+        phases.append({"phase": f"RGB {name} {options}, {ref['video'].name}", "requests": len(found),
+                       "colorspace": reference[0][1] if 0 in reference else None, "output": list(shape),
+                       "passed": all(r["passed"] for r in found)})
+    return results, phases
+
+
+def unchanged(kept: list[dict]) -> bool:
+    return bool(kept) and all([sha(image) for image in k["images"]] == k["hashes"] for k in kept)
 
 
 def main() -> int:
@@ -459,8 +596,10 @@ def main() -> int:
         started = time.perf_counter()
         index, hashes = sequential_reference(video, args.device)
         unreferenced, layers = unreferenced_frames(video, index)
+        with vidlo.VideoReader(video, device=args.device, format="nv12", index=index) as probe:
+            full_range = probe.metadata.full_range  # 按帧号读的读取器打开时不解码
         refs.append({"video": video, "index": index, "hashes": hashes, "unreferenced": unreferenced, "non_reference_by_layer": layers,
-                     "sequential_s": round(time.perf_counter() - started, 3)})
+                     "full_range": full_range, "sequential_s": round(time.perf_counter() - started, 3)})
         with (args.output / f"index-{video.stem}.json").open("x", encoding="utf-8") as stream:
             json.dump(index, stream)
 
@@ -480,10 +619,16 @@ def main() -> int:
         found, phase = run_config(refs[0], args.device, args.seed, args.clips, 20, capacity, skip)
         results += found
         phases.append(phase)
-    rgb = run_rgb(refs[0], args.device, args.seed, args.clips, 30)
-    if rgb is not None:
-        results += rgb[0]
-        phases.append(rgb[1])
+    kept: list[dict] = []
+    for ref in refs:
+        rgb = run_rgb(ref, args.device, args.seed, args.clips, kept)
+        if rgb is not None:
+            results += rgb[0]
+            phases += rgb[1]
+    if kept:
+        # 之后又开过别的读取器、复用过解码器：前面交出的图像仍是原来的内容
+        results.append({"request": "RGB: images of every setting unchanged after all readers closed",
+                        "frames": sum(len(k["hashes"]) for k in kept), "passed": unchanged(kept)})
     api, phase = run_api(refs[0], args.device, args.output)
     phases.append(phase)
     errors = error_checks(refs[0], args.device)
