@@ -31,93 +31,6 @@ void check_av(int err, const char* what) {
   }
 }
 
-// hvcC（ISO/IEC 14496-15 的 HEVCDecoderConfigurationRecord）：23 字节的固定部分，后面是各类 NAL 的数组。
-// 取出 VPS、SPS、PPS
-std::vector<std::vector<uint8_t>> hvcc_parameter_sets(const std::vector<uint8_t>& config) {
-  std::vector<std::vector<uint8_t>> sets;
-  size_t offset = 23;
-  const int arrays = config[22];
-  for (int a = 0; a < arrays; ++a) {
-    if (offset + 3 > config.size()) {
-      throw Error("hvcC array header runs past the end of codec config");
-    }
-    const int type = config[offset] & 0x3F;
-    const int count = (config[offset + 1] << 8) | config[offset + 2];
-    offset += 3;
-    for (int i = 0; i < count; ++i) {
-      if (offset + 2 > config.size()) {
-        throw Error("hvcC NAL length runs past the end of codec config");
-      }
-      const size_t length = (static_cast<size_t>(config[offset]) << 8) | config[offset + 1];
-      offset += 2;
-      if (length < 2 || length > config.size() - offset) {
-        throw Error("hvcC NAL unit runs past the end of codec config");
-      }
-      if (type >= 32 && type <= 34) {
-        sets.emplace_back(config.begin() + static_cast<std::ptrdiff_t>(offset),
-                          config.begin() + static_cast<std::ptrdiff_t>(offset + length));
-      }
-      offset += length;
-    }
-  }
-  if (offset != config.size()) {
-    throw Error("hvcC has unexpected trailing bytes");
-  }
-  return sets;
-}
-
-// 第一期要求一个包正好是一张完整的图像：按 hvcC 的 NAL 长度字段切开负载，长度之和必须等于包的大小；
-// 恰好有一个 VCL NAL 是图像的第一个 slice（first_slice_segment_in_pic_flag 为 1），且它出现在其他 VCL NAL 之前。
-// 包里的参数集必须与 codec_config 里的某一个逐字节相同：按帧号读时只送 codec_config 的参数集，
-// 码流中途换参数集会让两种读法解出不同的画面。
-void check_access_unit(const uint8_t* data, size_t size, int length_size, const std::vector<std::vector<uint8_t>>& parameter_sets,
-                       const std::string& where) {
-  size_t offset = 0;
-  int pictures = 0;
-  bool seen_slice = false;
-  while (offset < size) {
-    if (size - offset < static_cast<size_t>(length_size)) {
-      throw Error("truncated NAL length field in packet" + where);
-    }
-    size_t length = 0;
-    for (int i = 0; i < length_size; ++i) {
-      length = (length << 8) | data[offset + i];
-    }
-    offset += static_cast<size_t>(length_size);
-    if (length < 2 || length > size - offset) {
-      throw Error("NAL length " + std::to_string(length) + " does not fit the packet" + where);
-    }
-    const uint8_t* nal = data + offset;
-    const int type = (nal[0] >> 1) & 0x3F;
-    const int layer = ((nal[0] & 1) << 5) | (nal[1] >> 3);
-    if (layer != 0) {
-      throw UnsupportedError("multi-layer HEVC (nuh_layer_id > 0) is not supported yet" + where);
-    }
-    if (type <= 31) {  // VCL NAL：slice
-      if (length < 3) {
-        throw Error("slice NAL shorter than its header" + where);
-      }
-      if (nal[2] & 0x80) {
-        ++pictures;
-      } else if (!seen_slice) {
-        throw UnsupportedError("packet starts in the middle of a picture (a picture split across packets) is not supported yet" + where);
-      }
-      seen_slice = true;
-    } else if (type >= 32 && type <= 34) {
-      const bool known = std::any_of(parameter_sets.begin(), parameter_sets.end(), [&](const std::vector<uint8_t>& set) {
-        return set.size() == length && std::memcmp(set.data(), nal, length) == 0;
-      });
-      if (!known) {
-        throw UnsupportedError("a parameter set inside the stream differs from the codec config; not supported yet" + where);
-      }
-    }
-    offset += length;
-  }
-  if (pictures != 1) {
-    throw UnsupportedError("packet contains " + std::to_string(pictures) + " pictures; exactly one is supported" + where);
-  }
-}
-
 }  // namespace
 
 Demuxer::Demuxer(std::shared_ptr<Input> input, const std::string& name) : input_(std::move(input)) {
@@ -177,12 +90,7 @@ Demuxer::Demuxer(std::shared_ptr<Input> input, const std::string& name) : input_
       throw Error("video stream has no codec config (extradata)");
     }
     info_.codec_config.assign(par->extradata, par->extradata + par->extradata_size);
-    // hvcC：第 0 字节 configurationVersion 为 1，第 21 字节低 2 位是 NAL 长度字段的字节数减 1
-    if (info_.codec_config.size() < 23 || info_.codec_config[0] != 1) {
-      throw UnsupportedError("HEVC codec config is not an hvcC record; not supported yet");
-    }
-    nal_length_size_ = (info_.codec_config[21] & 3) + 1;
-    parameter_sets_ = hvcc_parameter_sets(info_.codec_config);
+    hvcc_ = parse_hvcc(info_.codec_config);
     info_.time_base_num = stream->time_base.num;
     info_.time_base_den = stream->time_base.den;
     if (info_.time_base_num <= 0 || info_.time_base_den <= 0) {
@@ -433,7 +341,7 @@ Demuxer::SourceInfo Demuxer::locate_payload(const AVPacket& packet) {
     throw UnsupportedError("packet data does not match the file bytes after the block header "
                            "(content compression or unexpected layout)" + where);
   }
-  check_access_unit(packet.data, static_cast<size_t>(packet.size), nal_length_size_, parameter_sets_, where);
+  check_access_unit(packet.data, static_cast<size_t>(packet.size), hvcc_, where);
   return source;
 }
 

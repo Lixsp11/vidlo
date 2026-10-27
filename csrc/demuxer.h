@@ -15,6 +15,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 }
 
+#include "hevc.h"
 #include "input.h"
 #include "mkv_scanner.h"
 
@@ -97,8 +98,7 @@ class Demuxer {
   StreamInfo info_;
   InputStats input_stats_;
   int64_t track_number_ = -1;
-  int nal_length_size_ = 0;                           // hvcC 里的 NAL 长度字段字节数
-  std::vector<std::vector<uint8_t>> parameter_sets_;  // hvcC 里的 VPS、SPS、PPS（含 NAL 头）
+  HvcC hvcc_;  // codec_config 的 NAL 长度字段字节数与参数集，用来逐包核对
   std::unique_ptr<MkvScanner> scanner_;
   bool scanning_ = false;  // 确认是 MKV 之后才扫描；在那之前读过的字节都留在窗口里，确认后从头补扫
   int64_t read_end_ = 0;  // 读到过的最远位置

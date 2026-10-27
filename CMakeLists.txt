@@ -29,7 +29,7 @@ get_filename_component(VIDLO_CVCUDA_LIBDIR "${VIDLO_LIB_cvcuda}" DIRECTORY)
 # 链接用 SDK 的 stub，运行时加载驱动自带的 libnvcuvid.so.1
 find_library(VIDLO_LIB_nvcuvid nvcuvid PATHS "${VIDLO_NVSDK_ROOT}/Lib/linux/stubs/x86_64" NO_DEFAULT_PATH REQUIRED)
 
-pybind11_add_module(_native csrc/module.cpp csrc/demuxer.cpp csrc/input.cpp csrc/mkv_scanner.cpp csrc/nvdec.cpp
+pybind11_add_module(_native csrc/module.cpp csrc/demuxer.cpp csrc/hevc.cpp csrc/input.cpp csrc/mkv_scanner.cpp csrc/nvdec.cpp
   csrc/postprocess.cpp)
 # CV-CUDA 的头文件引用 cuda_runtime.h；它的库自带静态 CUDA 运行库，本模块不链接 libcudart
 target_include_directories(_native PRIVATE "${VIDLO_FFMPEG_ROOT}/include" "${VIDLO_NVSDK_ROOT}/Interface"
