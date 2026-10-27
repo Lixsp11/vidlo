@@ -526,8 +526,8 @@ def main() -> int:
     checks["oss_internal_not_bool"] = expect_raises(
         ValueError, lambda: nv12_open("oss://bucket/key.mkv", storage_options={"region": "us-southeast-1", "use_internal_endpoint": "false"}))
     checks["remote_missing_credentials"] = check_missing_credentials()
-    checks["unsupported_index"] = expect_raises(vidlo.UnsupportedError, lambda: nv12_open(good, index={}))
-    checks["unsupported_read_sample"] = expect_raises(vidlo.UnsupportedError, lambda: vidlo.read_sample({}, {}, "/"))
+    checks["bad_index"] = expect_raises(vidlo.Error, lambda: nv12_open(good, index={}))  # 按帧号读的完整检查见 check_random.py
+    checks["bad_sample_index"] = expect_raises(vidlo.Error, lambda: vidlo.read_sample({}, {}, "/"))
     checks["unknown_scheme"] = expect_raises(ValueError, lambda: nv12_open("http://host/key.mkv"))
     checks["storage_options_for_local"] = expect_raises(ValueError, lambda: nv12_open(good, storage_options={"endpoint_url": "x"}))
     checks["missing_file"] = expect_raises(FileNotFoundError, lambda: nv12_open(videos / "missing.mkv"))
@@ -538,11 +538,11 @@ def main() -> int:
     checks["odd_crop"] = expect_raises(ValueError, lambda: vidlo.VideoReader(good, crop=(1, 0, 64, 64)))
     checks["unknown_colorspace"] = expect_raises(ValueError, lambda: vidlo.VideoReader(good, colorspace="source"))
     checks["old_nearest_name"] = expect_raises(ValueError, lambda: vidlo.VideoReader(good, interpolation="nearest"))
-    checks["no_len"] = expect_raises(TypeError, lambda: len(nv12_open(good)))  # 第二期有视频索引时才有帧数
+    checks["no_len"] = expect_raises(TypeError, lambda: len(nv12_open(good)))  # 只有按帧号读（有视频索引）时才有帧数
 
     # 打开、关闭的状态
     with nv12_open(good) as video:
-        checks["unsupported_get_frames_at"] = expect_raises(vidlo.UnsupportedError, lambda: video.get_frames_at([0]))
+        checks["get_frames_at_without_index"] = expect_raises(ValueError, lambda: video.get_frames_at([0]))
         checks["unsupported_submit"] = expect_raises(vidlo.UnsupportedError, lambda: video.submit([0]))
         iterator = iter(video)
         next(iterator)
