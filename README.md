@@ -79,7 +79,7 @@ vidlo fetches nothing when opening, then exactly the bytes the requested frames 
 
 [^pixels]: Resize algorithms differ: vidlo uses CV-CUDA area; torchcodec uses torch `area` (adaptive average pooling); OpenCV/decord use `cv2.INTER_AREA`. OpenCV converts as BT.601 regardless of the recording's full-range BT.709 tags; the others use BT.709.
 
-[^setup]: One recording only: `rgb-20261022-030320.mkv`, 7,706 frames, 322,673,914 bytes, closed GOPs of 60 frames with B-frames, MKV. Local file in page cache; GPU otherwise idle. NVIDIA H200, driver 570.133.20, CUDA 12.8, 20 visible Intel Xeon CPU cores, Python 3.12.13. Versions: vidlo 0.1 (development build) and torchcodec 0.17.0+cu126 with torch 2.14.1+cu126 both loaded FFmpeg 7.1.5; OpenCV 5.0.0 uses its bundled FFmpeg (libavcodec 62); decord 0.6.0 uses its bundled FFmpeg (libavcodec 58). decord is the PyPI CPU wheel; a GPU build requires compiling from source.
+[^setup]: One recording only: `rgb-20261022-030320.mkv`, 7,706 frames, 322,673,914 bytes, closed GOPs of 60 frames with B-frames, MKV. Local file in page cache; GPU otherwise idle. NVIDIA H200, driver 570.133.20, CUDA 12.8, 20 visible Intel Xeon CPU cores, Python 3.12.13. Versions: vidlo 0.2 (development build) and torchcodec 0.17.0+cu126 with torch 2.14.1+cu126 both loaded FFmpeg 7.1.5; OpenCV 5.0.0 uses its bundled FFmpeg (libavcodec 62); decord 0.6.0 uses its bundled FFmpeg (libavcodec 58). decord is the PyPI CPU wheel; a GPU build requires compiling from source.
 
 [^sequential]: OpenCV/decord use library-default CPU thread settings (`--threads 0`) with 1 process; at 8 processes, each has 2 decode threads and 2 cv2 threads. Total CPU cores used (CPU time / wall time) in the median-throughput trials at 8 processes: vidlo 7.59, torchcodec batches of 64 3.96, OpenCV 16.17, decord 18.11. torchcodec's `decoder[i]` per-frame call is much slower at 8 processes: 1,951 frames/s.
 
@@ -94,8 +94,8 @@ vidlo fetches nothing when opening, then exactly the bytes the requested frames 
 Wheels for Python 3.11–3.14 (Linux x86-64, manylinux_2_28) are attached to the [releases](https://github.com/Lixsp11/vidlo/releases).
 
 ```bash
-pip install vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl            # local files
-pip install "vidlo-0.1-cp312-cp312-manylinux_2_28_x86_64.whl[s3,oss]"  # plus R2/S3 and OSS
+pip install vidlo-0.2-cp312-cp312-manylinux_2_28_x86_64.whl            # local files
+pip install "vidlo-0.2-cp312-cp312-manylinux_2_28_x86_64.whl[s3,oss]"  # plus R2/S3 and OSS
 ```
 
 Needs an NVIDIA GPU from Turing on (the bundled CV-CUDA is built for sm_75, 80, 86, 89, 90, 100 and 120) with driver 570 or newer. In containers, `NVIDIA_DRIVER_CAPABILITIES` must include `video`.

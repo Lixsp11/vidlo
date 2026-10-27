@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "vidlo"
-version = "0.1"
+version = "0.2"
 description = "GPU video frame reader: NVDEC decoding, CV-CUDA crop/convert/resize, local and object storage"
 readme = "README.md"
 requires-python = ">=3.11"
