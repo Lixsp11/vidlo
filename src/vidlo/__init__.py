@@ -7,13 +7,14 @@ from importlib.metadata import version as _package_version
 
 from ._index import load_sample_index, load_video_index, validate_sample_index, validate_video_index
 from ._native import Error, TruncatedError, UnsupportedError
-from ._reader import Frame, VideoMetadata, VideoReader, read_sample
+from ._reader import Frame, FrameBatch, VideoMetadata, VideoReader, read_sample, set_decoder_cache_capacity
 
 __version__ = _package_version("vidlo")
 
 __all__ = [
     "Error",
     "Frame",
+    "FrameBatch",
     "TruncatedError",
     "UnsupportedError",
     "VideoMetadata",
@@ -21,6 +22,7 @@ __all__ = [
     "load_sample_index",
     "load_video_index",
     "read_sample",
+    "set_decoder_cache_capacity",
     "validate_sample_index",
     "validate_video_index",
 ]

@@ -82,10 +82,15 @@ def validate_video_index(index: dict[str, Any]) -> None:
         if not 0 <= start <= order:
             raise Error(f"video index: frame {frame} has decode_start {start} outside [0, decode_order={order}]")
 
+    frame_at = decode_positions(index)
+    # decode_start 指向的包必须是一个 GOP 的入口：那个包所属的帧，decode_start 就是它自己的解码位置
+    decode_start = arrays["decode_start"]
+    for frame, start in enumerate(decode_start):
+        entry = frame_at[start]
+        if decode_start[entry] != start:
+            raise Error(f"video index: frame {frame} has decode_start {start}, but the packet there (frame {entry}) does not start a GOP")
+
     # 按解码顺序，各包的字节范围递增、互不重叠、不超过文件大小
-    frame_at = [0] * count
-    for frame, order in enumerate(decode_order):
-        frame_at[order] = frame
     previous_end = 0
     for order in range(count):
         frame = frame_at[order]
@@ -94,6 +99,14 @@ def validate_video_index(index: dict[str, Any]) -> None:
             raise Error(f"video index: packet of frame {frame} (decode position {order}) has byte range [{start}, {end}) "
                         f"that overlaps the previous packet, is empty, or exceeds file_size {file_size}")
         previous_end = end
+
+
+def decode_positions(index: dict[str, Any]) -> list[int]:
+    """解码顺序第 k 个包属于哪一帧（decode_order 的反向映射）。decode_order 须已检查过是 0..帧数-1 的排列。"""
+    frame_at = [0] * len(index["decode_order"])
+    for frame, order in enumerate(index["decode_order"]):
+        frame_at[order] = frame
+    return frame_at
 
 
 def load_video_index(source: str | os.PathLike[str] | dict[str, Any]) -> dict[str, Any]:
@@ -109,8 +122,9 @@ def validate_sample_index(sample: dict[str, Any]) -> None:
     video = sample["video"]
     if not isinstance(video, str) or not video:
         raise Error("sample index: video must be a non-empty string")
-    path = PurePosixPath(video)
-    if path.is_absolute() or ".." in path.parts or "\\" in video:
+    # 每段都要有名字：拼到对象存储前缀后面时，空段、. 段会变成另一个对象键
+    segments = video.split("/")
+    if PurePosixPath(video).is_absolute() or "\\" in video or any(s in ("", ".", "..") for s in segments) or "://" in video:
         raise Error(f"sample index: video must be a relative path under the data root, got {video!r}")
     frames = sample["frames"]
     if not isinstance(frames, list) or not frames or not all(_is_int(v) and v >= 0 for v in frames):

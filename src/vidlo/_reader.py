@@ -1,11 +1,13 @@
 """公共读取接口，用法见 docs/api.md。
 
-当前实现到第一期：本地、R2（s3://）、OSS（oss://）的 MKV 顺序读，输出裁剪、缩放后的 RGB 或原生 NV12，可按步长或帧率选帧。
+已实现：本地、R2（s3://）、OSS（oss://）的 MKV 顺序读，输出裁剪、缩放后的 RGB 或原生 NV12，可按步长或帧率选帧；
+按视频索引从本地文件按帧号读（get_frames_at、get_frame_at、get_frames_in_range、下标与切片、read_sample）。
 架构里其余的参数和函数都保留，用到时报 UnsupportedError。
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import weakref
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from . import _hevc, _native, _storage
+from . import _hevc, _index, _native, _planner, _storage
 from ._native import Error, UnsupportedError
 from ._sampler import EMDownSampler, Sampler, StrideSampler
 
@@ -25,6 +27,8 @@ _REMOTE_SCHEMES = ("s3://", "oss://")
 # 码流的 matrix_coefficients（H.265 表 E.5）→ CV-CUDA 能用的矩阵
 _SOURCE_COLORSPACES = {1: "bt709", 5: "bt601", 6: "bt601", 9: "bt2020"}
 _SELECTION_CHUNK = 4096  # 每次交给 C++ 的选帧决定个数
+# 按帧号读时不读文件头，没有容器的颜色信息：按“容器没写”处理，只看 SPS
+_NO_CONTAINER_COLOR = {"range": 0, "matrix": 2, "chroma_location": 0}
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,7 @@ class Frame:
 
     image: np.ndarray
     number: int  # 显示顺序中的帧号，从 0 开始，没选中的帧也计数
-    pts: int  # 录像里的原始 PTS，乘 metadata.time_base 是秒
+    pts: int | None  # 录像里的原始 PTS，乘 metadata.time_base 是秒；按帧号读时不读文件头、索引也不存时间戳，为 None
     key_frame: bool
     decode_status: int  # cuvidGetDecodeStatus 的结果，交出的帧都是成功
     decode_order: int  # 这帧的包在解码顺序中排第几
@@ -45,24 +49,47 @@ class Frame:
     interpolation: str | None = None  # 实际用的插值；没缩放或 NV12 时为 None
 
 
+_FRAME_FIELDS = ("number", "pts", "key_frame", "decode_status", "decode_order", "decode_start", "packet_start", "packet_end",
+                 "colorspace", "interpolation")
+
+
+@dataclass(frozen=True)
+class FrameBatch:
+    """按帧号读一次交出的帧，按请求的顺序排列，重复的帧号各占一个位置（数据各自独立）。images 在 RGB 时为
+    [帧数, 高, 宽, 3]，NV12 时为 [帧数, 高×3/2, 宽]；其余属性与 Frame 同名，每项是按帧排列的列表。"""
+
+    images: np.ndarray
+    number: list[int]
+    pts: list[int | None]
+    key_frame: list[bool]
+    decode_status: list[int]
+    decode_order: list[int]
+    decode_start: list[int]
+    packet_start: list[int]
+    packet_end: list[int]
+    colorspace: list[str | None]
+    interpolation: list[str | None]
+
+
 @dataclass(frozen=True)
 class VideoMetadata:
-    """录像信息，打开时读文件头就全部得到。画面尺寸和颜色标记从码流的 SPS 读出；container_ 开头的三项是 MKV 容器
-    另记的颜色信息（FFmpeg 的枚举值），打开时与 SPS 核对。"""
+    """录像信息。画面尺寸和颜色标记从码流的 SPS 读出。顺序读时打开就读文件头，全部得到；container_ 开头的三项是 MKV 容器
+    另记的颜色信息（FFmpeg 的枚举值），打开时与 SPS 核对。按帧号读时不读文件头，SPS 来自视频索引的 codec_config，
+    container、time_base 和 container_ 开头的三项为 None。"""
 
-    container: str  # libavformat 的格式名，如 "matroska,webm"
+    container: str | None  # libavformat 的格式名，如 "matroska,webm"
     codec: str
     codec_config: bytes  # 文件头里的解码参数（MKV 的 hvcC），写视频索引要用
-    time_base: tuple[int, int]  # (分子, 分母)
+    time_base: tuple[int, int] | None  # (分子, 分母)
     file_size: int
     width: int  # 显示区域的尺寸，不随 crop、width、height 参数改变
     height: int
     full_range: bool
     matrix_coefficients: int  # H.265 表 E.5 的编号：1 为 BT.709，2 为未标注
     chroma_location: int  # ChromaLocType：0 为 type 0
-    container_range: int  # AVColorRange：0 未指定，1 limited，2 full
-    container_matrix: int  # AVColorSpace，编号同 matrix_coefficients
-    container_chroma_location: int  # AVChromaLocation：0 未指定，1 起依次是 type 0 到 5
+    container_range: int | None  # AVColorRange：0 未指定，1 limited，2 full
+    container_matrix: int | None  # AVColorSpace，编号同 matrix_coefficients
+    container_chroma_location: int | None  # AVChromaLocation：0 未指定，1 起依次是 type 0 到 5
     etag: str | None  # 远程对象的 ETag，读取期间用它确认对象没变；本地文件为 None
 
 
@@ -136,7 +163,7 @@ class VideoReader:
     source 为本地路径、s3://桶/路径（R2 等 S3 兼容存储）或 oss://桶/路径。crop 为 (x, y, 宽, 高)，坐标相对于显示区域，
     四个数都必须是偶数（每 2×2 像素共用一份色度）；width、height 为输出尺寸，没给的一边保持裁剪后的尺寸。colorspace 是
     YUV 换成 RGB 用的矩阵，None 按录像标记。format="nv12" 是解码器的原始输出，不裁剪、不缩放、不换颜色。index 为视频
-    索引（按帧号读时用，第二期）。storage_options 是交给存储 SDK 的连接参数，见 _storage.py。
+    索引：给了就只按帧号读，不读文件头。storage_options 是交给存储 SDK 的连接参数，见 _storage.py。
     """
 
     def __init__(
@@ -171,8 +198,6 @@ class VideoReader:
             raise ValueError(f"format must be one of {_FORMATS}, got {format!r}")
         if format == "nv12" and any(v is not None for v in (crop, width, height, interpolation, colorspace)):
             raise ValueError("format='nv12' is the decoder's raw output; crop, width, height, interpolation and colorspace do not apply")
-        if index is not None:
-            raise UnsupportedError("reading by frame number (index=...) is not implemented yet")
         self._device = device
         self._crop = crop
         self._width = width
@@ -182,7 +207,16 @@ class VideoReader:
         self._format = format
         self._started = False
         self._closed = False
+        self._failed = False  # 按帧号读出过错：之后的请求一律报错，包括空请求
+        self._index: _planner.VideoIndex | None = None
+        self._download = None
+        if index is None:
+            self._open_sequential(source, storage_options)
+        else:
+            self._open_indexed(source, index, storage_options)
 
+    def _open_sequential(self, source: str | os.PathLike[str], storage_options: dict[str, Any] | None) -> None:
+        """顺序读：读文件头，建解码会话。"""
         download = None
         if isinstance(source, str) and "://" in source:
             if not source.startswith(_REMOTE_SCHEMES):
@@ -201,7 +235,8 @@ class VideoReader:
             native = _native.SequentialDecoder(data, name)
             info = native.info()
             sps = _hevc.stream_sps(info["codec_config"])
-            native.start(device, self._output_spec(sps, info["container_color"]))
+            self._spec = self._output_spec(sps, info["container_color"])
+            native.start(self._device, self._spec)
         except BaseException:
             if download is not None:
                 download.close()
@@ -221,6 +256,38 @@ class VideoReader:
         if download is not None:
             # 没有 close 就丢掉时也要让下载线程停下，否则它会一直等着往满了的队列里推数据
             weakref.finalize(self, download.cancel)
+
+    def _open_indexed(self, source: str | os.PathLike[str], index: Any, storage_options: dict[str, Any] | None) -> None:
+        """按帧号读：只读视频索引，不读文件头；SPS 取自索引的 codec_config。第一次 get_frames_at 时才初始化 CUDA。"""
+        data = _index.load_video_index(index)
+        if isinstance(source, str) and "://" in source:
+            if not source.startswith(_REMOTE_SCHEMES):
+                raise ValueError(f"unknown source scheme in {source!r}; use a local path, s3:// or oss://")
+            raise UnsupportedError("reading by frame number from object storage is not implemented yet")
+        if storage_options is not None:
+            raise ValueError("storage_options only apply to s3:// and oss:// sources")
+        name = os.fspath(source)
+        if not os.path.isfile(name):
+            raise FileNotFoundError(name)
+        file_input = _native.FileInput(name)
+        if file_input.size != data["file_size"]:
+            raise Error(f"{name} has {file_input.size} bytes but the video index says {data['file_size']}: the index is for another file")
+        codec_config = base64.b64decode(data["codec_config"])
+        sps = _hevc.stream_sps(codec_config)
+        self._spec = self._output_spec(sps, _NO_CONTAINER_COLOR)
+        self._native = _native.IndexedDecoder(file_input, codec_config, self._device, self._spec)
+        self._index = _planner.VideoIndex(data, _index.decode_positions(data))
+        left, top, right, bottom = sps.display_area
+        if self._spec.rgb:
+            self._image_shape = (self._spec.height or self._spec.crop_height or bottom - top,
+                                 self._spec.width or self._spec.crop_width or right - left, 3)
+        else:
+            self._image_shape = ((bottom - top) * 3 // 2, right - left)
+        self._metadata = VideoMetadata(
+            container=None, codec=data["codec"], codec_config=codec_config, time_base=None, file_size=data["file_size"],
+            width=right - left, height=bottom - top, full_range=bool(sps.video_full_range_flag),
+            matrix_coefficients=sps.matrix_coefficients, chroma_location=sps.chroma_sample_loc_type_top_field,
+            container_range=None, container_matrix=None, container_chroma_location=None, etag=None)
 
     def _output_spec(self, sps: _hevc.Sps, container: dict[str, int]) -> _native.OutputSpec:
         """按 SPS 检查输出 RGB 的条件，给出交给 C++ 的输出规格。原生 NV12 输出不做颜色转换，不受这些限制。"""
@@ -290,6 +357,8 @@ class VideoReader:
         但不转换、不交出。每个 VideoReader 只能顺序读一遍。"""
         self._check_open()
         sampler = _sampler(step, fps, source_fps)
+        if self._index is not None:
+            raise Error("this VideoReader was opened with a video index; read frames with get_frames_at")
         if self._started:
             raise Error("a VideoReader can only be read sequentially once")
         self._started = True
@@ -312,10 +381,72 @@ class VideoReader:
             image, info = item
             yield Frame(image=image, **info)
 
-    def get_frames_at(self, frames: list[int]) -> Any:
-        """按帧号列表读，保持列表的顺序和重复项，返回 FrameBatch：images 为 [帧数, 高, 宽, 3]，
-        其余属性与 Frame 同名、按帧排列。"""
-        raise UnsupportedError("reading by frame number is not implemented yet")
+    def __len__(self) -> int:
+        """帧数，即视频索引的帧数。顺序读时帧数要读完才知道，报 TypeError（同没有长度的对象）。"""
+        if self._index is None:
+            raise TypeError("the frame count is only known when reading by frame number (open the VideoReader with index=...)")
+        return self._index.count
+
+    def __bool__(self) -> bool:
+        return True  # 不经 __len__：顺序读的读取器没有帧数
+
+    def __getitem__(self, key: int | slice) -> Frame | FrameBatch:
+        """reader[i] 同 get_frame_at(i)；reader[a:b:k] 按切片的规则取帧号，可以倒序，返回 FrameBatch。"""
+        if isinstance(key, slice):
+            return self.get_frames_at(list(range(*key.indices(self._require_index().count))))
+        return self.get_frame_at(key)
+
+    def get_frame_at(self, number: int) -> Frame:
+        """按帧号读一帧，负数从末尾数。"""
+        batch = self.get_frames_at([number])
+        return Frame(image=batch.images[0], **{name: getattr(batch, name)[0] for name in _FRAME_FIELDS})
+
+    def get_frames_in_range(self, start: int, stop: int, step: int = 1) -> FrameBatch:
+        """帧号从 start 起、到 stop 之前，每 step 帧取一帧（同 range）。负数从末尾数，超出的边界按切片的规则收进录像范围；
+        step 必须为正，倒序请用切片或 get_frames_at。"""
+        for name, value in (("start", start), ("stop", stop), ("step", step)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}")
+        if step <= 0:
+            raise ValueError(f"step must be positive, got {step}")
+        return self.get_frames_at(list(range(*slice(start, stop, step).indices(self._require_index().count))))
+
+    def _require_index(self) -> _planner.VideoIndex:
+        self._check_open()
+        if self._index is None:
+            raise ValueError("reading by frame number needs a video index: open the VideoReader with index=...")
+        return self._index
+
+    def get_frames_at(self, frames: list[int]) -> FrameBatch:
+        """按帧号列表读，保持列表的顺序和重复项（负下标从末尾数，-1 是最后一帧），返回 FrameBatch。要打开时给了视频索引。
+        一次请求从所需帧中最早的 GOP 入口解码到解码顺序最靠后的所需帧，只读这一段字节；要么交出全部帧，要么报错。"""
+        self._require_index()
+        if self._failed:
+            raise Error("an earlier error stopped reading this video")
+        numbers = _planner.frame_numbers(frames, self._index.count)
+        if not numbers:
+            return self._batch([], np.empty((0, *self._image_shape), dtype=np.uint8), {})
+        plan = _planner.plan(self._index, numbers)
+        try:
+            decoded = self._native.read(plan.range_start, plan.range_end, plan.packets, np.array(plan.targets, dtype=np.int64))
+        except Error:
+            self._failed = True
+            raise
+        images = {number: image for number, image, _ in decoded}
+        statuses = {number: status for number, _, status in decoded}
+        # np.stack 复制到新数组：重复的帧号各占一份，与 C++ 交出的缓冲无关
+        return self._batch(numbers, np.stack([images[n] for n in numbers]), statuses)
+
+    def _batch(self, numbers: list[int], images: np.ndarray, statuses: dict[int, int]) -> FrameBatch:
+        index = self._index
+        colorspace = self._spec.colorspace if self._spec.rgb else None
+        interpolation = (self._spec.interpolation or None) if self._spec.rgb else None
+        return FrameBatch(
+            images=images, number=list(numbers), pts=[None] * len(numbers), key_frame=[bool(index.key_frame[n]) for n in numbers],
+            decode_status=[statuses[n] for n in numbers], decode_order=[int(index.decode_order[n]) for n in numbers],
+            decode_start=[int(index.decode_start[n]) for n in numbers], packet_start=[int(index.packet_start[n]) for n in numbers],
+            packet_end=[int(index.packet_end[n]) for n in numbers], colorspace=[colorspace] * len(numbers),
+            interpolation=[interpolation] * len(numbers))
 
     def submit(self, frames: list[int]) -> Any:
         """get_frames_at() 的异步版本，返回可取结果或取消的请求句柄。"""
@@ -356,6 +487,39 @@ def read_sample(
     colorspace: str | None = None,
     format: str = "rgb24",
     storage_options: dict[str, Any] | None = None,
-) -> Any:
-    """按样本索引读帧（格式见 docs/index-format.md）：在 root 下打开样本的录像，对样本的帧号列表按 step 或 fps 选帧后读取，返回值同 VideoReader.get_frames_at。"""
-    raise UnsupportedError("reading by sample index is not implemented yet")
+) -> FrameBatch:
+    """按样本索引读帧（格式见 docs/index-format.md）：在 root 下打开样本的录像，对样本的帧号列表按 step 或 fps 选帧后读取，
+    返回值同 VideoReader.get_frames_at。先检查两份索引和样本全部帧号的上界，再选帧，选帧丢掉的越界帧号也报错。
+    step、fps 作用在样本帧号列表的位置上（step=2 取第 0、2、4… 项），不看帧号本身的间隔。"""
+    sample = _index.load_sample_index(sample_index)
+    index = _index.load_video_index(video_index)
+    count = len(index["decode_order"])
+    over = [f for f in sample["frames"] if f >= count]
+    if over:
+        raise IndexError(f"sample frames {over[:5]} are out of range for a video with {count} frames")
+    sampler = _sampler(step, fps, source_fps)
+    frames = list(sample["frames"]) if sampler is None else sampler.select(sample["frames"])
+    with VideoReader(_sample_source(root, sample["video"]), device=device, crop=crop, width=width, height=height,
+                     interpolation=interpolation, colorspace=colorspace, format=format, index=index,
+                     storage_options=storage_options) as reader:
+        return reader.get_frames_at(frames)
+
+
+def _sample_source(root: str | os.PathLike[str], video: str) -> str:
+    """样本录像的位置：本地根目录按路径各段拼接；s3://、oss:// 前缀只在后面接上对象键，不做 URL 解析（样本路径已检查过
+    是不含 ..、空段、. 段的相对 POSIX 路径）。"""
+    base = os.fspath(root)
+    if "://" in base:
+        if not base.startswith(_REMOTE_SCHEMES):
+            raise ValueError(f"unknown root scheme in {base!r}; use a local directory, s3:// or oss://")
+        return base.rstrip("/") + "/" + video
+    return os.path.join(base, *video.split("/"))
+
+
+def set_decoder_cache_capacity(capacity: int) -> None:
+    """按帧号读时，每个进程每块 GPU 缓存几个空闲的硬件解码器（默认 1）。新建、销毁硬件解码器要几十到两百多毫秒，
+    缓存让下一次请求直接复用，换文件也一样，只要视频格式（编码、尺寸、位深等）相同。每个空闲解码器占一些显存；
+    设为 0 关闭缓存并销毁现有的空闲解码器。"""
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+        raise ValueError(f"capacity must be a non-negative integer, got {capacity!r}")
+    _native.set_decoder_cache_capacity(capacity)
