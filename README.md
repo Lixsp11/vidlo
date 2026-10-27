@@ -30,64 +30,14 @@
 
 ## Comparison
 
-All libraries read the same recording and return CPU `uint8` RGB at 832×480 after cropping 16 columns from each side.[^pixels] NVIDIA H200, 20 Intel Xeon CPU cores; HEVC Main, 1,280×720 at 60 fps.[^setup][^reproduce]
-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/compare-dark.svg">
-    <img alt="Bar chart of speed relative to OpenCV for sequential reading, reading by frame number and reading from OSS; the values are in the tables below." src="docs/assets/compare-light.svg">
+    <img alt="Bar chart of speed relative to OpenCV for sequential reading, reading by frame number and reading from OSS." src="docs/assets/compare-light.svg">
   </picture>
 </p>
 
-Speed relative to OpenCV, higher is better: frames/s for sequential reading, otherwise the inverse of the median time per request (on OSS, per sample including opening the reader). torchcodec uses its faster call in each case (1 frame per call with 1 process, 64 frames per call with 8 processes). On OSS, torchcodec and OpenCV read ahead 1 MiB; HTTP requests and bytes are in the object storage table.
-
-**Sequential reading** — aggregate frames/s, median of 3 trials; each process reads the whole recording after warm-up.[^sequential]
-
-| Library / call | 1 process | 8 processes |
-| --- | ---: | ---: |
-| vidlo (CUDA) | 1,524 | 5,352 |
-| torchcodec (CUDA), `get_frames_in_range`, 1 frame/call | 1,243 | 4,841 |
-| torchcodec (CUDA), `get_frames_in_range`, 64 frames/call | 943 | 5,915 |
-| OpenCV (CPU) | 446 | 899 |
-| decord (CPU) | 420 | 977 |
-
-vidlo is fastest with 1 process; torchcodec in batches of 64 is fastest at 8 processes (vidlo returns one frame at a time and has no batch call for sequential reading).
-
-**Reading by frame number** — 1 process, p50 (p90) ms/request; the same 30 requests per shape for every library, using a warmed reader.[^metadata]
-
-| Library | 16 consecutive frames | 81 frames, every 2nd |
-| --- | ---: | ---: |
-| vidlo | 27.9 (35.1) | 102.0 (123.8) |
-| torchcodec | 37.9 (50.2) | 167.3 (191.7) |
-| OpenCV | 200.5 (267.3) | 556.0 (684.6) |
-| decord | 217.7 (267.2) | 751.1 (961.7) |
-
-Every returned frame matched the same library's sequential read bit for bit; this does not imply identical pixels across libraries.[^pixels]
-
-**Object storage** — Alibaba Cloud OSS, internal endpoint in the same region. Each sample opens a new reader and requests 81 frames, every 2nd. Counts and decimal MB are medians including opening; time is p50 (p90) ms for opening plus reading.[^oss]
-
-| Library | Read-ahead | HTTP GETs (at open) | MB fetched (at open) | Time, ms |
-| --- | ---: | ---: | ---: | ---: |
-| vidlo | — | 1 (0) | 7.95 (0) | 152 (186) |
-| torchcodec | 1 MiB | 10 (1) | 9.44 (1.05) | 254 (332) |
-| torchcodec | 8 MiB | 3 (1) | 16.78 (8.39) | 255 (318) |
-| OpenCV | 1 MiB | 11 (1) | 10.49 (1.05) | 532 (622) |
-| OpenCV | 8 MiB | 4 (1) | 25.17 (8.39) | 622 (757) |
-| decord | — | 1 (1) | 322.67 (322.67) | 3,116 (—) |
-
-vidlo fetches nothing when opening, then exactly the bytes the requested frames need with one request. The other libraries read the container header when opening and then read through a file object, so their request count depends on the read-ahead: a larger block means fewer requests but more bytes, and it did not make a sample faster here. A reader kept open across samples of one video pays for opening once; per sample it then needs 9 (1 MiB) or 2 (8 MiB) requests with torchcodec and 10 or 3 with OpenCV. decord reads the whole 323 MB object into memory when it opens. OSS speed varies substantially over minutes: requests and bytes are the stable comparison. These are resource measurements, not monetary costs.
-
-[^pixels]: Resize algorithms differ: vidlo uses CV-CUDA area; torchcodec uses torch `area` (adaptive average pooling); OpenCV/decord use `cv2.INTER_AREA`. OpenCV converts as BT.601 regardless of the recording's full-range BT.709 tags; the others use BT.709.
-
-[^setup]: One recording only: `rgb-20261022-030320.mkv`, 7,706 frames, 322,673,914 bytes, closed GOPs of 60 frames with B-frames, MKV. Local file in page cache; GPU otherwise idle. NVIDIA H200, driver 570.133.20, CUDA 12.8, 20 visible Intel Xeon CPU cores, Python 3.12.13. Versions: vidlo 0.2 (development build) and torchcodec 0.17.0+cu126 with torch 2.14.1+cu126 both loaded FFmpeg 7.1.5; OpenCV 5.0.0 uses its bundled FFmpeg (libavcodec 62); decord 0.6.0 uses its bundled FFmpeg (libavcodec 58). decord is the PyPI CPU wheel; a GPU build requires compiling from source.
-
-[^sequential]: OpenCV/decord use library-default CPU thread settings (`--threads 0`) with 1 process; at 8 processes, each has 2 decode threads and 2 cv2 threads. Total CPU cores used (CPU time / wall time) in the median-throughput trials at 8 processes: vidlo 7.59, torchcodec batches of 64 3.96, OpenCV 16.17, decord 18.11. torchcodec's `decoder[i]` per-frame call is much slower at 8 processes: 1,951 frames/s.
-
-[^metadata]: vidlo receives a precomputed video index; torchcodec receives `custom_frame_mappings` from `ffprobe`; preparing and loading these are outside the timers. OpenCV/decord receive no precomputed per-video metadata. This also applies to OSS. Local requests follow a full sequential reference read and a warm-up request for each shape; CPU libraries use their default thread settings.
-
-[^oss]: vidlo uses its own indexed storage reader: one Range GET covering the needed byte range. The other three use a file object adapter with a shared OSS client per process, no SDK retries, known object size (no HEAD), one Range GET per cache miss for at least the read-ahead size, and one cached block. The six rows alternated in 3 rounds in the same time window: vidlo and each torchcodec/OpenCV setting took 4 timed samples after 1 warm-up per round (12 total); decord took 1 per round without warm-up (3 total, so no p90 reported), from the same request list. All remote outputs matched the same library's local reads; no request was retried.
-
-[^reproduce]: Run `python benchmarks/compare.py --help` ([script](benchmarks/compare.py)). Use a separate invocation per library, mode and configuration, each library in its own environment, with the recording, frame count, index/mappings and thread/sample settings above. Supply the OSS source, object size and storage options for remote runs.
+Speed relative to OpenCV, higher is better: one 1,280×720 HEVC recording on an NVIDIA H200, every library returning 832×480 RGB frames. Reading by frame number is one request for 16 consecutive frames, or 81 frames taking every 2nd; OSS opens a reader on Alibaba Cloud OSS and makes one such 81-frame request. Measured with [benchmarks/compare.py](benchmarks/compare.py).
 
 ## Install
 
