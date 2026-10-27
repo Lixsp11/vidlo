@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430" role="img" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Speed relative to OpenCV, higher is better</title>
+<rect x="181.2" y="17" width="12" height="12" rx="3" fill="#c98500"/>
+<text x="199.2" y="27.5" font-size="13" fill="#f0efec">OpenCV (CPU)</text>
+<rect x="301.6" y="17" width="12" height="12" rx="3" fill="#199e70"/>
+<text x="319.6" y="27.5" font-size="13" fill="#f0efec">decord (CPU)</text>
+<rect x="422.0" y="17" width="12" height="12" rx="3" fill="#d95926"/>
+<text x="440.0" y="27.5" font-size="13" fill="#f0efec">torchcodec (CUDA)</text>
+<rect x="578.4" y="17" width="12" height="12" rx="3" fill="#3987e5"/>
+<text x="596.4" y="27.5" font-size="13" fill="#f0efec">vidlo (CUDA)</text>
+<line x1="64" x2="864" y1="364.0" y2="364.0" stroke="#383835" stroke-width="1"/>
+<text x="54" y="368.0" font-size="12" text-anchor="end" fill="#898781">0×</text>
+<line x1="64" x2="864" y1="289.0" y2="289.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54" y="293.0" font-size="12" text-anchor="end" fill="#898781">2×</text>
+<line x1="64" x2="864" y1="214.0" y2="214.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54" y="218.0" font-size="12" text-anchor="end" fill="#898781">4×</text>
+<line x1="64" x2="864" y1="139.0" y2="139.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54" y="143.0" font-size="12" text-anchor="end" fill="#898781">6×</text>
+<line x1="64" x2="864" y1="64.0" y2="64.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54" y="68.0" font-size="12" text-anchor="end" fill="#898781">8×</text>
+<text transform="translate(20,214.0) rotate(-90)" font-size="13" text-anchor="middle" fill="#c3c2b7">Speed relative to OpenCV</text>
+<path d="M90.0,364.0 V330.5 Q90.0,326.5 94.0,326.5 H110.0 Q114.0,326.5 114.0,330.5 V364.0 Z" fill="#c98500"/>
+<text x="102.0" y="320.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.0</text>
+<path d="M118.0,364.0 V332.7 Q118.0,328.7 122.0,328.7 H138.0 Q142.0,328.7 142.0,332.7 V364.0 Z" fill="#199e70"/>
+<text x="130.0" y="322.7" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">0.94</text>
+<path d="M146.0,364.0 V263.5 Q146.0,259.5 150.0,259.5 H166.0 Q170.0,259.5 170.0,263.5 V364.0 Z" fill="#d95926"/>
+<text x="158.0" y="253.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">2.8</text>
+<path d="M174.0,364.0 V239.9 Q174.0,235.9 178.0,235.9 H194.0 Q198.0,235.9 198.0,239.9 V364.0 Z" fill="#3987e5"/>
+<text x="186.0" y="229.9" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">3.4</text>
+<text x="144.0" y="388.0" font-size="13" text-anchor="middle" fill="#f0efec">Sequential</text>
+<text x="144.0" y="406.0" font-size="12" text-anchor="middle" fill="#c3c2b7">1 process</text>
+<path d="M250.0,364.0 V330.5 Q250.0,326.5 254.0,326.5 H270.0 Q274.0,326.5 274.0,330.5 V364.0 Z" fill="#c98500"/>
+<text x="262.0" y="320.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.0</text>
+<path d="M278.0,364.0 V327.3 Q278.0,323.3 282.0,323.3 H298.0 Q302.0,323.3 302.0,327.3 V364.0 Z" fill="#199e70"/>
+<text x="290.0" y="317.3" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.1</text>
+<path d="M306.0,364.0 V121.4 Q306.0,117.4 310.0,117.4 H326.0 Q330.0,117.4 330.0,121.4 V364.0 Z" fill="#d95926"/>
+<text x="318.0" y="111.4" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">6.6</text>
+<path d="M334.0,364.0 V144.9 Q334.0,140.9 338.0,140.9 H354.0 Q358.0,140.9 358.0,144.9 V364.0 Z" fill="#3987e5"/>
+<text x="346.0" y="134.9" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">6.0</text>
+<text x="304.0" y="388.0" font-size="13" text-anchor="middle" fill="#f0efec">Sequential</text>
+<text x="304.0" y="406.0" font-size="12" text-anchor="middle" fill="#c3c2b7">8 processes</text>
+<path d="M410.0,364.0 V330.5 Q410.0,326.5 414.0,326.5 H430.0 Q434.0,326.5 434.0,330.5 V364.0 Z" fill="#c98500"/>
+<text x="422.0" y="320.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.0</text>
+<path d="M438.0,364.0 V333.5 Q438.0,329.5 442.0,329.5 H458.0 Q462.0,329.5 462.0,333.5 V364.0 Z" fill="#199e70"/>
+<text x="450.0" y="323.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">0.92</text>
+<path d="M466.0,364.0 V169.6 Q466.0,165.6 470.0,165.6 H486.0 Q490.0,165.6 490.0,169.6 V364.0 Z" fill="#d95926"/>
+<text x="478.0" y="159.6" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">5.3</text>
+<path d="M494.0,364.0 V98.5 Q494.0,94.5 498.0,94.5 H514.0 Q518.0,94.5 518.0,98.5 V364.0 Z" fill="#3987e5"/>
+<text x="506.0" y="88.5" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">7.2</text>
+<text x="464.0" y="388.0" font-size="13" text-anchor="middle" fill="#f0efec">By frame number</text>
+<text x="464.0" y="406.0" font-size="12" text-anchor="middle" fill="#c3c2b7">16 consecutive</text>
+<path d="M570.0,364.0 V330.5 Q570.0,326.5 574.0,326.5 H590.0 Q594.0,326.5 594.0,330.5 V364.0 Z" fill="#c98500"/>
+<text x="582.0" y="320.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.0</text>
+<path d="M598.0,364.0 V340.2 Q598.0,336.2 602.0,336.2 H618.0 Q622.0,336.2 622.0,340.2 V364.0 Z" fill="#199e70"/>
+<text x="610.0" y="330.2" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">0.74</text>
+<path d="M626.0,364.0 V243.4 Q626.0,239.4 630.0,239.4 H646.0 Q650.0,239.4 650.0,243.4 V364.0 Z" fill="#d95926"/>
+<text x="638.0" y="233.4" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">3.3</text>
+<path d="M654.0,364.0 V163.6 Q654.0,159.6 658.0,159.6 H674.0 Q678.0,159.6 678.0,163.6 V364.0 Z" fill="#3987e5"/>
+<text x="666.0" y="153.6" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">5.5</text>
+<text x="624.0" y="388.0" font-size="13" text-anchor="middle" fill="#f0efec">By frame number</text>
+<text x="624.0" y="406.0" font-size="12" text-anchor="middle" fill="#c3c2b7">81, every 2nd</text>
+<path d="M730.0,364.0 V330.5 Q730.0,326.5 734.0,326.5 H750.0 Q754.0,326.5 754.0,330.5 V364.0 Z" fill="#c98500"/>
+<text x="742.0" y="320.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">1.0</text>
+<path d="M758.0,364.0 V361.6 Q758.0,357.6 762.0,357.6 H778.0 Q782.0,357.6 782.0,361.6 V364.0 Z" fill="#199e70"/>
+<text x="770.0" y="351.6" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">0.17</text>
+<path d="M786.0,364.0 V289.5 Q786.0,285.5 790.0,285.5 H806.0 Q810.0,285.5 810.0,289.5 V364.0 Z" fill="#d95926"/>
+<text x="798.0" y="279.5" font-size="12" font-weight="400" text-anchor="middle" fill="#c3c2b7">2.1</text>
+<path d="M814.0,364.0 V236.8 Q814.0,232.8 818.0,232.8 H834.0 Q838.0,232.8 838.0,236.8 V364.0 Z" fill="#3987e5"/>
+<text x="826.0" y="226.8" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">3.5</text>
+<text x="784.0" y="388.0" font-size="13" text-anchor="middle" fill="#f0efec">OSS, new reader</text>
+<text x="784.0" y="406.0" font-size="12" text-anchor="middle" fill="#c3c2b7">81, every 2nd</text>
+</svg>
