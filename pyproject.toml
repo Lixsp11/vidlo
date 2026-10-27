@@ -11,9 +11,10 @@ requires-python = ">=3.11"
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
-# 读对象存储时才需要；只读本地文件的环境不必安装。urllib3 2.3 起才有 HTTPResponse.shutdown()，关闭时靠它打断读取
-s3 = ["boto3>=1.36", "urllib3>=2.3"]
-oss = ["alibabacloud-oss-v2>=1.4", "urllib3>=2.3"]
+# 读对象存储时才需要；只读本地文件的环境不必安装。关闭或超时时靠 urllib3 的 HTTPResponse.shutdown() 打断读取，
+# 2.5 起它不会打断已归还连接池、被别的请求复用的连接
+s3 = ["boto3>=1.36", "urllib3>=2.5"]
+oss = ["alibabacloud-oss-v2>=1.4", "urllib3>=2.5"]
 
 [tool.scikit-build]
 cmake.version = ">=3.22"
