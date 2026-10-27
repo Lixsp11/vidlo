@@ -52,8 +52,8 @@ bool same_format(const CUVIDEOFORMAT& a, const CUVIDEOFORMAT& b) {
 
 }  // namespace
 
-NvdecSession::NvdecSession(int device, cudaVideoCodec codec, unsigned clock_rate, OutputSpec output)
-    : codec_(codec), process_(getpid()), processor_(std::make_unique<FrameProcessor>(std::move(output))) {
+NvdecSession::NvdecSession(int device, cudaVideoCodec codec, unsigned clock_rate, OutputSpec output, bool cache_decoder)
+    : codec_(codec), process_(getpid()), cache_decoder_(cache_decoder), processor_(std::make_unique<FrameProcessor>(std::move(output))) {
   try {
     pid_t first = 0;
     if (!cuda_process.compare_exchange_strong(first, process_) && first != process_) {
@@ -86,7 +86,6 @@ NvdecSession::NvdecSession(int device, cudaVideoCodec codec, unsigned clock_rate
     {
       ContextScope scope(context_);
       check_cu(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
-      check_cu(cuvidCtxLockCreate(&lock_, context_), "cuvidCtxLockCreate");
     }
 
     CUVIDPARSERPARAMS params{};
@@ -124,11 +123,11 @@ void NvdecSession::release() {
     // fork 出的子进程里：这些句柄属于父进程的 CUDA，子进程不能调用 CUDA 去释放，只丢掉句柄；
     // 持有显存的 FrameProcessor 也不析构（析构会调用 CUDA）
     (void)processor_.release();
+    (void)hardware_.release();
     frames_.clear();
     parser_ = nullptr;
     decoder_ = nullptr;
     stream_ = nullptr;
-    lock_ = nullptr;
     context_ = nullptr;
     context_retained_ = false;
     return;
@@ -138,24 +137,24 @@ void NvdecSession::release() {
     parser_ = nullptr;
   }
   frames_.clear();
-  if (context_ != nullptr && (decoder_ != nullptr || stream_ != nullptr || processor_ != nullptr)) {
+  if (context_ != nullptr && (stream_ != nullptr || processor_ != nullptr)) {
     CUcontext popped = nullptr;
     if (cuCtxPushCurrent(context_) == CUDA_SUCCESS) {
       processor_.reset();  // 释放它的显存需要 context
-      if (decoder_ != nullptr) {
-        cuvidDestroyDecoder(decoder_);
-      }
       if (stream_ != nullptr) {
         cuStreamDestroy(stream_);
       }
       cuCtxPopCurrent(&popped);
     }
-    decoder_ = nullptr;
     stream_ = nullptr;
   }
-  if (lock_ != nullptr) {
-    cuvidCtxLockDestroy(lock_);
-    lock_ = nullptr;
+  decoder_ = nullptr;
+  if (hardware_ != nullptr) {
+    if (keep_decoder_) {
+      DecoderCache::instance().give(std::move(hardware_));
+    } else {
+      hardware_.reset();  // 在它自己的 context 里销毁
+    }
   }
   if (context_retained_) {
     cuDevicePrimaryCtxRelease(device_);
@@ -212,6 +211,22 @@ bool NvdecSession::pop(DecodedFrame& out) {
 std::vector<PictureInfo> NvdecSession::take_pictures() { return std::exchange(pictures_, {}); }
 
 void NvdecSession::add_selection(const std::vector<bool>& keep) { selection_.insert(selection_.end(), keep.begin(), keep.end()); }
+
+void NvdecSession::keep_decoder() {
+  // 只放回确认干净的解码器：EOS 已排空、没有出过错（调用方在核对完帧数、帧身份之后才调用）
+  if (!finished_ || failed_ || !stats_.end_of_stream) {
+    throw Error("only a session that finished without errors can return its decoder to the cache");
+  }
+  keep_decoder_ = cache_decoder_ && hardware_ != nullptr;
+}
+
+void NvdecSession::set_targets(const std::vector<int64_t>& timestamps) {
+  if (stats_.packets != 0 || !selection_.empty()) {
+    throw Error("set_targets must come before any packet or selection");
+  }
+  by_timestamp_ = true;
+  targets_.insert(timestamps.begin(), timestamps.end());
+}
 
 void NvdecSession::parse(CUVIDSOURCEDATAPACKET& packet) {
   CUresult result;
@@ -323,27 +338,6 @@ int NvdecSession::handle_sequence(const CUVIDEOFORMAT& format) {
   }
   // 颜色范围与色度位置只影响 RGB 输出，在颜色转换那一步检查；原生 YUV 输出不涉及
 
-  CUVIDDECODECAPS caps{};
-  caps.eCodecType = format.codec;
-  caps.eChromaFormat = format.chroma_format;
-  caps.nBitDepthMinus8 = format.bit_depth_luma_minus8;
-  check_cu(cuvidGetDecoderCaps(&caps), "cuvidGetDecoderCaps");
-  snapshot_.caps = caps;
-  if (!caps.bIsSupported) {
-    throw UnsupportedError("this GPU cannot decode this codec / chroma format / bit depth");
-  }
-  if (!(caps.nOutputFormatMask & (1u << cudaVideoSurfaceFormat_NV12))) {
-    throw UnsupportedError("this GPU cannot output NV12 for this format");
-  }
-  if (format.coded_width < caps.nMinWidth || format.coded_height < caps.nMinHeight || format.coded_width > caps.nMaxWidth ||
-      format.coded_height > caps.nMaxHeight) {
-    throw UnsupportedError("coded size " + std::to_string(format.coded_width) + "x" + std::to_string(format.coded_height) +
-                           " is outside what this GPU supports");
-  }
-  if ((format.coded_width >> 4) * (format.coded_height >> 4) > caps.nMaxMBCount) {
-    throw UnsupportedError("macroblock count exceeds what this GPU supports");
-  }
-
   CUVIDDECODECREATEINFO create{};
   create.ulWidth = format.coded_width;
   create.ulHeight = format.coded_height;
@@ -361,14 +355,41 @@ int NvdecSession::handle_sequence(const CUVIDEOFORMAT& format) {
   create.ulTargetWidth = format.coded_width;
   create.ulTargetHeight = format.coded_height;
   create.ulNumOutputSurfaces = 2;
-  create.vidLock = lock_;
-  create.enableHistogram = 0;
-  check_cu(cuvidCreateDecoder(&decoder_, &create), "cuvidCreateDecoder");
-  snapshot_.create = create;
-  snapshot_.create.vidLock = nullptr;
+  create.enableHistogram = 0;  // vidLock 由 HardwareDecoder 建锁时填
   if (create.ulNumDecodeSurfaces >= kSelectionReserve) {
     throw Error("decoder needs " + std::to_string(create.ulNumDecodeSurfaces) + " surfaces, more than the selection reserve");
   }
+
+  if (cache_decoder_) {
+    hardware_ = DecoderCache::instance().take(device_, create);
+    reused_decoder_ = hardware_ != nullptr;
+  }
+  if (hardware_ == nullptr) {
+    CUVIDDECODECAPS caps{};
+    caps.eCodecType = format.codec;
+    caps.eChromaFormat = format.chroma_format;
+    caps.nBitDepthMinus8 = format.bit_depth_luma_minus8;
+    check_cu(cuvidGetDecoderCaps(&caps), "cuvidGetDecoderCaps");
+    if (!caps.bIsSupported) {
+      throw UnsupportedError("this GPU cannot decode this codec / chroma format / bit depth");
+    }
+    if (!(caps.nOutputFormatMask & (1u << cudaVideoSurfaceFormat_NV12))) {
+      throw UnsupportedError("this GPU cannot output NV12 for this format");
+    }
+    if (format.coded_width < caps.nMinWidth || format.coded_height < caps.nMinHeight || format.coded_width > caps.nMaxWidth ||
+        format.coded_height > caps.nMaxHeight) {
+      throw UnsupportedError("coded size " + std::to_string(format.coded_width) + "x" + std::to_string(format.coded_height) +
+                             " is outside what this GPU supports");
+    }
+    if ((format.coded_width >> 4) * (format.coded_height >> 4) > caps.nMaxMBCount) {
+      throw UnsupportedError("macroblock count exceeds what this GPU supports");
+    }
+    hardware_ = std::make_unique<HardwareDecoder>(context_, device_, create, caps);
+  }
+  // 命中缓存时，能力是建那个解码器时查到的（同一设备、同样的建立参数）
+  decoder_ = hardware_->decoder;
+  snapshot_.caps = hardware_->caps;
+  snapshot_.create = create;
   processor_->configure(format);
   return static_cast<int>(create.ulNumDecodeSurfaces);
 }
@@ -397,11 +418,16 @@ int NvdecSession::handle_display(const CUVIDPARSERDISPINFO* display) {
   if (!display->progressive_frame) {
     throw UnsupportedError("interlaced frames are not supported yet");
   }
-  if (selection_.empty()) {
-    throw Error("no selection decision for the displayed frame (caller did not keep the selection reserve)");
+  bool keep;
+  if (by_timestamp_) {
+    keep = targets_.count(display->timestamp) != 0;
+  } else {
+    if (selection_.empty()) {
+      throw Error("no selection decision for the displayed frame (caller did not keep the selection reserve)");
+    }
+    keep = selection_.front();
+    selection_.pop_front();
   }
-  const bool keep = selection_.front();
-  selection_.pop_front();
   CUVIDPROCPARAMS proc{};
   proc.progressive_frame = display->progressive_frame;
   proc.second_field = 0;

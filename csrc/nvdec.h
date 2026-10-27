@@ -12,8 +12,10 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
+#include "decoder_cache.h"
 #include "postprocess.h"
 
 namespace vidlo {
@@ -56,15 +58,20 @@ struct DecoderStats {
   bool end_of_stream = false;
 };
 
-// 一个 NVDEC 解码会话：parser + decoder。同步基线：显示回调里映射、检查状态，选中的帧裁剪到自有显存后归还 surface，
-// 再转换、缩放并复制到内存。
-// 哪些帧选中由调用方事先按显示顺序给出（add_selection）。一次 feed 或 finish 交出的帧不会多于解码 surface 数，
-// 调用方在 feed、finish 之前保证 selection_pending() 不少于 kSelectionReserve。
+// 一个 NVDEC 解码会话：parser + decoder。同步基线：显示回调里映射、检查状态，选中的帧裁剪、转换、缩放并复制到内存，
+// 同步之后归还 surface。
+// 哪些帧选中有两种给法，二选一：
+// - 顺序读：调用方事先按显示顺序给出（add_selection）。一次 feed 或 finish 交出的帧不会多于解码 surface 数，
+//   调用方在 feed、finish 之前保证 selection_pending() 不少于 kSelectionReserve。
+// - 按帧号读：送包时的时间戳就是帧号，set_targets 给出要的帧号，显示回调按时间戳挑。不能按显示位置数：
+//   显示在目标之前、解码顺序在区间之外的 B 帧根本没送进来，位置会错开。
+// cache_decoder 为真时，硬件解码器先从 DecoderCache 取；会话正常结束、调用方核对无误后调用 keep_decoder()，析构时放回缓存，
+// 否则销毁。parser、码流状态、后处理都随会话新建。
 class NvdecSession {
  public:
   static constexpr size_t kSelectionReserve = 64;  // 建解码器时检查解码 surface 数小于它
 
-  NvdecSession(int device, cudaVideoCodec codec, unsigned clock_rate, OutputSpec output);
+  NvdecSession(int device, cudaVideoCodec codec, unsigned clock_rate, OutputSpec output, bool cache_decoder = false);
   ~NvdecSession();
   NvdecSession(const NvdecSession&) = delete;
   NvdecSession& operator=(const NvdecSession&) = delete;
@@ -75,6 +82,9 @@ class NvdecSession {
   std::vector<PictureInfo> take_pictures();  // 取走上次以来解码的图像信息
   void add_selection(const std::vector<bool>& keep);  // 接下来按显示顺序各帧是否选中
   size_t selection_pending() const { return selection_.size(); }
+  void set_targets(const std::vector<int64_t>& timestamps);  // 改为按时间戳选帧，送包之前调用
+  void keep_decoder();  // finish() 成功之后调用：析构时把硬件解码器放回缓存
+  bool reused_decoder() const { return reused_decoder_; }  // 硬件解码器是不是从缓存取的
 
   // 会话是在别的进程里建的（本进程是建好之后 fork 出来的）时报错：子进程不能用父进程的 CUDA
   void check_process() const;
@@ -99,10 +109,13 @@ class NvdecSession {
   CUdevice device_ = 0;
   CUcontext context_ = nullptr;
   bool context_retained_ = false;
-  CUvideoctxlock lock_ = nullptr;
   CUstream stream_ = nullptr;
   CUvideoparser parser_ = nullptr;
-  CUvideodecoder decoder_ = nullptr;
+  std::unique_ptr<HardwareDecoder> hardware_;  // 建好或从缓存取出的硬件解码器，连同它的锁
+  CUvideodecoder decoder_ = nullptr;           // hardware_->decoder
+  bool cache_decoder_ = false;
+  bool keep_decoder_ = false;
+  bool reused_decoder_ = false;
 
   // 回调里出的错，回调返回后由 parse() 抛出。只保存 exception_ptr，记录过程本身不分配内存、不会再抛异常
   std::exception_ptr callback_error_;
@@ -112,6 +125,8 @@ class NvdecSession {
 
   std::unique_ptr<FrameProcessor> processor_;  // 显存在建解码器时分配，在 release() 里持有 context 时释放
   std::deque<bool> selection_;
+  bool by_timestamp_ = false;  // set_targets 之后按时间戳选帧
+  std::unordered_set<int64_t> targets_;
   std::deque<DecodedFrame> frames_;
   std::vector<PictureInfo> pictures_;
   DecoderSnapshot snapshot_;
